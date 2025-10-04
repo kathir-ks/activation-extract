@@ -187,7 +187,11 @@ Environment Variables:
   CLOUD_BUCKET         GCS bucket for outputs
   GCP_KEY_PATH         Path to GCP service account key
 
-For more details, see README.md and QUICKSTART.md
+Documentation:
+  README.md                 - Main documentation
+  QUICKSTART.md            - Quick start guide
+  DOCKER_MULTIHOST.md      - Multi-host TPU setup (v5e-256, v4-512, etc.)
+  QUICK_START_EXTRACTION.md - Activation extraction guide
 EOF
         ;;
 esac

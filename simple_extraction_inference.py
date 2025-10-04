@@ -20,17 +20,23 @@ from arc_inference_jax import (
     ARCConfig, create_prompts, validate_grid,
     create_solutions, load_jax_model_and_tokenizer
 )
+from qwen2_jax_with_hooks import create_model_with_hooks, QwenConfig
 
 
 @dataclass
 class ExtractionConfig:
     """Configuration for activation extraction"""
     extract_activations: bool = True
-    layers_to_extract: List[int] = None  # None = all layers
+    layers_to_extract: List[int] = None  # None = all layers, default will be set to range(10, 24)
     activations_dir: str = './activations'
     save_every_n_samples: int = 100
     upload_to_cloud: bool = False
     cloud_bucket: Optional[str] = None
+
+    def __post_init__(self):
+        # Set default to layers 10-23 if not specified
+        if self.layers_to_extract is None:
+            self.layers_to_extract = list(range(10, 24))
 
 
 class SimpleActivationExtractor:

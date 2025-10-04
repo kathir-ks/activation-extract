@@ -26,13 +26,21 @@ This pipeline enables you to:
 
 ## 📚 Documentation
 
+**📖 [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)** - Complete documentation index and navigation guide
+
+### Quick Links
+
 | Document | Description |
 |----------|-------------|
-| **[QUICKSTART.md](QUICKSTART.md)** | ⭐ **Start here!** Step-by-step guide |
+| **[QUICKSTART.md](QUICKSTART.md)** | ⭐ **Start here!** Single-host TPU guide |
+| **[DOCKER_MULTIHOST.md](DOCKER_MULTIHOST.md)** | 📦 Multi-host TPU Docker setup (v5e-256, v4-512) |
+| [MULTIHOST_QUICKREF.md](MULTIHOST_QUICKREF.md) | Quick command reference for multi-host |
+| [README_ACTIVATION_EXTRACTION.md](README_ACTIVATION_EXTRACTION.md) | Activation extraction guide |
+| [QUICK_START_EXTRACTION.md](QUICK_START_EXTRACTION.md) | Quick start for extraction |
+| [LAYERS_CONFIG.md](LAYERS_CONFIG.md) | Layer extraction configuration (10-23) |
 | [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) | What was built and how it works |
-| [README_DISTRIBUTED_INFERENCE.md](README_DISTRIBUTED_INFERENCE.md) | Detailed architecture and TPU setup |
+| [README_DISTRIBUTED_INFERENCE.md](README_DISTRIBUTED_INFERENCE.md) | Distributed inference architecture |
 | [README_TESTS.md](README_TESTS.md) | Testing documentation |
-| [FILES_OVERVIEW.txt](FILES_OVERVIEW.txt) | Complete file listing |
 
 ## 📁 Project Structure
 

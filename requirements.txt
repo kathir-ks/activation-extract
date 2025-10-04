@@ -1,0 +1,31 @@
+# Core dependencies for ARC-AGI Distributed Inference Pipeline
+# Python 3.10+
+
+# JAX (TPU support installed separately in Dockerfile)
+jax>=0.4.13
+jaxlib>=0.4.13
+
+# Transformers and ML
+transformers>=4.30.0
+torch>=2.0.0
+tokenizers>=0.13.0
+
+# Data processing
+datasets>=2.14.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Utilities
+tqdm>=4.65.0
+jinja2>=3.1.0
+termcolor>=2.3.0
+
+# Cloud storage
+google-cloud-storage>=2.10.0
+
+# Testing (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Logging and monitoring
+psutil>=5.9.0

@@ -1,0 +1,62 @@
+# Docker ignore file for ARC-AGI pipeline
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Output directories (will be mounted as volumes)
+outputs/
+activations/
+pipeline_output/
+arc_data/
+results/
+logs/
+
+# Temporary files
+*.log
+*.tmp
+temp/
+tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation (optional - include if needed)
+*.md
+docs/
+
+# Large model files (should be downloaded at runtime)
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.pt

@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  arc-inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: arc-agi-inference:latest
+
+    # For TPU access (on GCP TPU VMs)
+    privileged: true
+
+    volumes:
+      # Mount output directories
+      - ./outputs:/workspace/outputs
+      - ./activations:/workspace/activations
+      - ./logs:/workspace/logs
+
+      # Mount data directories
+      - ./arc_data:/workspace/arc_data
+
+      # Mount GCP credentials (optional)
+      - ${GCP_KEY_PATH:-./gcp-key.json}:/secrets/gcp-key.json:ro
+
+      # Mount model cache (optional, for faster loading)
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+
+    environment:
+      # JAX configuration
+      - JAX_PLATFORMS=tpu
+      - XLA_FLAGS=--xla_dump_to=/workspace/logs/xla_dumps
+
+      # Python configuration
+      - PYTHONUNBUFFERED=1
+
+      # Hugging Face
+      - HF_HOME=/root/.cache/huggingface
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+
+      # GCP configuration
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp-key.json
+      - CLOUD_BUCKET=${CLOUD_BUCKET:-}
+
+    # Resource limits (adjust based on your setup)
+    deploy:
+      resources:
+        limits:
+          cpus: '16'
+          memory: 64G
+
+    # Keep container running for interactive use
+    # Comment out for batch jobs
+    stdin_open: true
+    tty: true
+
+    # Default command (override with docker-compose run)
+    command: python distributed_inference_with_activations.py --help
+
+  # Service for data transformation only
+  transform-data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: arc-agi-inference:latest
+
+    volumes:
+      - ./arc_data:/workspace/arc_data
+      - ./logs:/workspace/logs
+
+    command: >
+      python transform_hf_to_arc.py
+      --dataset barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems
+      --output_dir /workspace/arc_data
+      --max_samples ${MAX_SAMPLES:-1000}
+
+  # Service for simple extraction (testing)
+  simple-inference:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: arc-agi-inference:latest
+
+    volumes:
+      - ./outputs:/workspace/outputs
+      - ./activations:/workspace/activations
+      - ./arc_data:/workspace/arc_data
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_HOME=/root/.cache/huggingface
+
+    command: >
+      python simple_extraction_inference.py
+      --model_path ${MODEL_PATH:-Qwen/Qwen2.5-0.5B}
+      --dataset_path /workspace/arc_data/arc_format_train.json
+      --output_path /workspace/outputs/predictions.json
+      --activations_dir /workspace/activations
+      --max_tasks ${MAX_TASKS:-10}

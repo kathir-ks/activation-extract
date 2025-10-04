@@ -303,6 +303,65 @@ def distributed_generate(model, params, input_ids, max_tokens):
     return generated
 
 
+def create_prompts(data: Dict, grid_encoder, tokenizer, prompt_version: str, predictions_per_task: int):
+    """Create prompts for all tasks with data augmentation"""
+    prompts = []
+    for task_id, task in tqdm(data.items(), total=len(data), desc='Creating prompts'):
+        data_augmentation_params = list(product([False, True], [0, 1, 2, 3]))
+        num_augmentations = len(data_augmentation_params)
+
+        # Calculate how many times to repeat each augmentation
+        repeats_per_aug = max(1, predictions_per_task // num_augmentations)
+
+        for hflip, n_rot90 in data_augmentation_params:
+            for _ in range(repeats_per_aug):
+                color_map = get_random_color_map(change_background_probability=0.1)
+                data_augmentation_kwargs = dict(hflip=hflip, n_rot90=n_rot90, color_map=color_map)
+                augmented_task = apply_data_augmentation(task, **data_augmentation_kwargs)
+                task_prompts = create_prompts_from_task(
+                    augmented_task, grid_encoder=grid_encoder, tokenizer=tokenizer,
+                    is_train_prompt=False, prompt_version=prompt_version)
+                for idx, prompt in enumerate(task_prompts):
+                    prompts.append(dict(task_id=task_id,
+                                      data_augmentation_kwargs=data_augmentation_kwargs,
+                                      prompt=prompt,
+                                      idx=idx))
+
+            # Break early if we only need a subset of augmentations
+            if len(prompts) >= predictions_per_task * len(task['test']):
+                break
+
+    return prompts
+
+
+def create_solutions(predictions: List[Dict], data: Dict, grid_encoder):
+    """Create final solutions from predictions"""
+    solutions = {}
+    for task_id, task in data.items():
+        solutions[task_id] = [dict() for _ in task['test']]
+
+    for pred in predictions:
+        task_id = pred['task_id']
+        sample_idx = pred.get('idx', 0)
+        data_augmentation_kwargs = pred['data_augmentation_kwargs']
+
+        try:
+            # Parse grid from prediction text
+            grid = parse_grid_from_response(pred['prediction'], grid_encoder)
+            # Revert augmentation
+            grid = revert_data_augmentation(grid, **data_augmentation_kwargs)
+
+            # Add to solutions
+            if task_id in solutions and sample_idx < len(solutions[task_id]):
+                attempt_name = f"attempt_{len(solutions[task_id][sample_idx]) + 1}"
+                solutions[task_id][sample_idx][attempt_name] = grid.tolist()
+        except Exception as e:
+            # Skip failed parses
+            pass
+
+    return solutions
+
+
 def distribute_data_across_devices(data: List, n_devices: int, batch_size: int):
     """
     Distribute data across devices for parallel processing
@@ -358,12 +417,140 @@ def inference_main_distributed():
             data = dict(islice(data.items(), cfg.n_tasks))
         print(f'Loaded {len(data)} tasks from {cfg.dataset_path}')
 
-        # TODO: Complete the distributed inference implementation
-        # This is a framework - full implementation continues in part 2
+        # Load tokenizer
+        print(f"\nLoading tokenizer from {cfg.model_path}...")
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
 
-        print("\nDistributed inference framework initialized!")
-        print("Note: Full implementation requires completing the model loading")
-        print("and distributed forward pass with proper sharding.")
+        # Create grid encoder
+        grid_encoder = create_grid_encoder(cfg.grid_encoder)
+
+        # Create model with activation hooks
+        print(f"Creating model with activation hooks for layers {cfg.layers_to_extract}...")
+        qwen_config = QwenConfig(max_position_embeddings=cfg.max_model_len)
+        model = create_model_with_activation_hooks(qwen_config, cfg.layers_to_extract)
+
+        # Load model weights
+        print(f"Loading model weights from {cfg.model_path}...")
+        hf_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, trust_remote_code=True)
+        params = convert_hf_to_jax_weights(hf_model, qwen_config)
+        del hf_model  # Free memory
+
+        # Initialize model
+        key = jax.random.PRNGKey(cfg.random_seed if cfg.random_seed else 42)
+        dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
+        variables = model.init(key, dummy_input)
+
+        # Replace initialized params with loaded weights
+        params_dict = {'params': params}
+
+        # Replicate parameters across devices for pmap
+        n_devices = jax.local_device_count()
+        print(f"\nReplicating model across {n_devices} devices...")
+        replicated_params = jax.tree_map(lambda x: jnp.array([x] * n_devices), params_dict)
+
+        # Create prompts
+        print(f"\nCreating prompts for {len(data)} tasks...")
+        prompts = create_prompts(
+            data,
+            grid_encoder=grid_encoder,
+            tokenizer=tokenizer,
+            prompt_version=cfg.prompt_version,
+            predictions_per_task=cfg.predictions_per_task
+        )
+        print(f"Created {len(prompts)} prompts")
+
+        # Tokenize all prompts
+        print("Tokenizing prompts...")
+        tokenized_prompts = []
+        for prompt_data in tqdm(prompts, desc="Tokenizing"):
+            input_ids = tokenizer.encode(prompt_data['prompt'], return_tensors='np')
+            tokenized_prompts.append({
+                **prompt_data,
+                'input_ids': input_ids
+            })
+
+        # Distribute data across devices
+        print(f"\nDistributing data across {n_devices} devices...")
+        distributed_batches = distribute_data_across_devices(
+            tokenized_prompts,
+            n_devices=n_devices,
+            batch_size=cfg.batch_size
+        )
+
+        print(f"Processing {len(distributed_batches)} batches...")
+
+        # Run distributed inference
+        all_predictions = []
+
+        for batch_idx, batch in enumerate(tqdm(distributed_batches, desc="Inference batches")):
+            # batch shape: [n_devices, batch_per_device, ...]
+
+            # Extract input_ids and pad to same length
+            max_len = max(item['input_ids'].shape[1] for device_batch in batch for item in device_batch)
+
+            batch_input_ids = []
+            batch_metadata = []
+
+            for device_batch in batch:
+                device_input_ids = []
+                for item in device_batch:
+                    input_ids = item['input_ids'][0]  # Remove batch dim
+                    # Pad to max_len
+                    padded = jnp.pad(input_ids, (0, max_len - len(input_ids)), constant_values=tokenizer.pad_token_id or 0)
+                    device_input_ids.append(padded)
+                    batch_metadata.append(item)
+
+                batch_input_ids.append(jnp.stack(device_input_ids))
+
+            batch_input_ids = jnp.stack(batch_input_ids)  # [n_devices, batch_per_device, seq_len]
+
+            # Distributed generation
+            generated_ids = distributed_generate(
+                model,
+                replicated_params,
+                batch_input_ids,
+                cfg.max_output_tokens
+            )
+
+            # Decode predictions
+            for dev_idx in range(n_devices):
+                for sample_idx in range(generated_ids.shape[1]):
+                    gen_ids = generated_ids[dev_idx, sample_idx]
+                    decoded = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+                    idx = dev_idx * cfg.batch_size + sample_idx
+                    if idx < len(batch_metadata):
+                        meta = batch_metadata[idx]
+                        all_predictions.append({
+                            'task_id': meta['task_id'],
+                            'prediction': decoded,
+                            'data_augmentation_kwargs': meta['data_augmentation_kwargs']
+                        })
+
+            # Extract activations if enabled
+            if activation_extractor and batch_idx % cfg.save_every_n_batches == 0:
+                activation_extractor.save_batch()
+
+        # Save final activations
+        if activation_extractor:
+            activation_extractor.finalize()
+
+        # Create solutions from predictions
+        print(f"\nCreating solutions from {len(all_predictions)} predictions...")
+        solutions = create_solutions(all_predictions, data, grid_encoder)
+
+        # Save outputs
+        print(f"Saving predictions to {cfg.output_filepath}...")
+        os.makedirs(os.path.dirname(cfg.output_filepath) or '.', exist_ok=True)
+        with open(cfg.output_filepath, 'w') as f:
+            json.dump(solutions, f, indent=2)
+
+        print("\n" + "="*70)
+        print("DISTRIBUTED INFERENCE COMPLETE!")
+        print(f"Predictions saved to: {cfg.output_filepath}")
+        if activation_extractor:
+            print(f"Activations saved to: {cfg.activations_dir}")
+        print("="*70)
 
 
 def parse_args_distributed():
@@ -376,6 +563,13 @@ def parse_args_distributed():
     parser.add_argument('--output_filepath', type=str)
     parser.add_argument('--activations_dir', type=str)
     parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--n_tasks', type=int, help='Number of tasks to process (for testing)')
+    parser.add_argument('--max_output_tokens', type=int, help='Max tokens to generate')
+    parser.add_argument('--predictions_per_task', type=int, help='Predictions per task')
+    parser.add_argument('--grid_encoder', type=str, help='Grid encoder configuration')
+    parser.add_argument('--prompt_version', type=str, help='Prompt version')
+    parser.add_argument('--random_seed', type=int, help='Random seed')
+    parser.add_argument('--save_every_n_batches', type=int, help='Save activations every N batches')
     parser.add_argument('--extract_activations', action='store_true')
     parser.add_argument('--layers_to_extract', type=int, nargs='+')
     parser.add_argument('--upload_to_cloud', action='store_true')

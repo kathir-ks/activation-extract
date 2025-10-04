@@ -22,6 +22,7 @@ import pickle
 
 from transformers import AutoTokenizer
 from qwen2_jax import QwenModel, QwenConfig, convert_hf_to_jax_weights
+from qwen2_jax_with_hooks import QwenModelWithActivations, create_model_with_hooks
 from transformers import AutoModelForCausalLM
 import torch
 
@@ -61,7 +62,7 @@ class DistributedARCConfig:
 
     # Activation extraction config
     extract_activations: bool = True
-    layers_to_extract: List[int] = field(default_factory=lambda: [0, 11, 23])  # First, middle, last layers
+    layers_to_extract: List[int] = field(default_factory=lambda: list(range(10, 24)))  # Layers 10-23
     save_every_n_batches: int = 10
     upload_to_cloud: bool = False
     cloud_bucket: Optional[str] = None  # e.g., 'gs://my-bucket/activations'
@@ -223,9 +224,8 @@ def create_model_with_activation_hooks(config: QwenConfig, layers_to_extract: Li
 
     This modifies the model to capture intermediate layer activations
     """
-    # This is a placeholder - actual implementation depends on qwen2_jax structure
-    # You'll need to modify qwen2_jax.py to support activation extraction
-    model = QwenModel(config)
+    # Use the QwenModelWithActivations from qwen2_jax_with_hooks.py
+    model = create_model_with_hooks(config, layers_to_extract=layers_to_extract)
     return model
 
 
@@ -251,18 +251,27 @@ def generate_with_activations(
     generated_ids = input_ids
 
     for step in range(max_tokens):
-        # Forward pass
-        logits = model.apply(params, generated_ids)
+        # Forward pass with activation extraction
+        logits, activations = model.apply(params, generated_ids, return_activations=True)
 
-        # TODO: Extract activations from intermediate layers
-        # This requires modifying the model to return intermediate activations
-        # For now, we'll extract from the final logits layer
-        if 23 in activation_extractor.config.layers_to_extract:  # Last layer
-            activation_extractor.extract_layer_activation(
-                23, logits, task_id, sample_idx
-            )
+        # Extract activations from intermediate layers
+        for layer_name, layer_activations in activations.items():
+            # Extract layer number from name (e.g., 'layer_12' -> 12)
+            if layer_name.startswith('layer_'):
+                layer_idx_str = layer_name.replace('layer_', '').replace('_norm', '')
+                try:
+                    layer_idx = int(layer_idx_str)
+                    if layer_idx in activation_extractor.config.layers_to_extract:
+                        # Extract last token position (the one being predicted)
+                        last_token_activation = layer_activations[:, -1, :]  # [batch, hidden_dim]
+                        activation_extractor.extract_layer_activation(
+                            layer_idx, last_token_activation, task_id, sample_idx
+                        )
+                except ValueError:
+                    # Skip non-numeric layer names
+                    pass
 
-        # Sample next token
+        # Sample next token (greedy decoding)
         next_token_logits = logits[:, -1, :]
         next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
         generated_ids = jnp.concatenate([generated_ids, next_token_id], axis=1)

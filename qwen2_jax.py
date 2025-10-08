@@ -17,7 +17,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from dataclasses import dataclass
 import math
-
+from functools import partial
+import time
 
 @dataclass
 class QwenConfig:
@@ -110,7 +111,7 @@ class QwenMLP(nn.Module):
 class QwenAttention(nn.Module):
     """Multi-headed attention with grouped query attention support."""
     config: QwenConfig
-    
+
     def setup(self):
         self.hidden_size = self.config.hidden_size
         self.num_heads = self.config.num_attention_heads
@@ -119,26 +120,21 @@ class QwenAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = self.config.max_position_embeddings
         self.rope_theta = self.config.rope_theta
-    
-    def _init_rope(self):
-        """Initialize rotary position embeddings."""
+
+        # Pre-compute and cache RoPE embeddings
         dim = self.head_dim
         max_seq_len = self.max_position_embeddings
-        
         inv_freq = 1.0 / (self.rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
         t = jnp.arange(max_seq_len).astype(jnp.float32)
-        
         freqs = jnp.outer(t, inv_freq)
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        
-        cos = jnp.cos(emb)
-        sin = jnp.sin(emb)
-        return cos, sin
-    
+        self.rope_cos = jnp.cos(emb)
+        self.rope_sin = jnp.sin(emb)
+
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None):
+    def __call__(self, hidden_states, attention_mask=None, kv_cache=None, position_offset=0):
         batch_size, seq_len, _ = hidden_states.shape
-        
+
         q_proj = nn.Dense(
             self.num_heads * self.head_dim,
             use_bias=True,
@@ -157,35 +153,42 @@ class QwenAttention(nn.Module):
             dtype=self.config.dtype,
             name='v_proj'
         )(hidden_states)
-        
+
         # Reshape for attention computation
         q = q_proj.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        
-        # Apply rotary embeddings
-        cos, sin = self._init_rope()
-        position_ids = jnp.arange(seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-        
+
+        # Apply rotary embeddings (use cached values)
+        position_ids = jnp.arange(position_offset, position_offset + seq_len)
+        q, k = apply_rotary_pos_emb(q, k, self.rope_cos, self.rope_sin, position_ids)
+
+        # Handle KV cache
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = jnp.concatenate([k_cache, k], axis=2)
+            v = jnp.concatenate([v_cache, v], axis=2)
+
+        new_kv_cache = (k, v)
+
         # Repeat k/v heads if using GQA
         if self.num_key_value_groups > 1:
             k = jnp.repeat(k, self.num_key_value_groups, axis=1)
             v = jnp.repeat(v, self.num_key_value_groups, axis=1)
-        
+
         # Compute attention scores
         attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
-        
+
         # Apply attention mask
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
-        
+
         attn_weights = nn.softmax(attn_weights, axis=-1).astype(self.config.dtype)
         attn_output = jnp.matmul(attn_weights, v)
-        
+
         # Reshape back
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.hidden_size)
-        
+
         # Output projection
         attn_output = nn.Dense(
             self.hidden_size,
@@ -193,40 +196,42 @@ class QwenAttention(nn.Module):
             dtype=self.config.dtype,
             name='o_proj'
         )(attn_output)
-        
-        return attn_output
+
+        return attn_output, new_kv_cache
 
 
 class QwenDecoderLayer(nn.Module):
     """Qwen decoder layer."""
     config: QwenConfig
-    
+
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None):
+    def __call__(self, hidden_states, attention_mask=None, kv_cache=None, position_offset=0):
         residual = hidden_states
-        
+
         # Self Attention
         hidden_states = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps, self.config.dtype, name='input_layernorm')(hidden_states)
-        hidden_states = QwenAttention(self.config, name='self_attn')(hidden_states, attention_mask)
+        hidden_states, new_kv_cache = QwenAttention(self.config, name='self_attn')(
+            hidden_states, attention_mask, kv_cache, position_offset
+        )
         hidden_states = residual + hidden_states
-        
+
         # MLP
         residual = hidden_states
         hidden_states = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps, self.config.dtype, name='post_attention_layernorm')(hidden_states)
         hidden_states = QwenMLP(self.config, name='mlp')(hidden_states)
         hidden_states = residual + hidden_states
-        
-        return hidden_states
+
+        return hidden_states, new_kv_cache
 
 
 class QwenModel(nn.Module):
     """Qwen model implementation in JAX."""
     config: QwenConfig
-    
+
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None):
+    def __call__(self, input_ids, attention_mask=None, kv_caches=None, position_offset=0):
         batch_size, seq_len = input_ids.shape
-        
+
         # Token embeddings
         embed_tokens = nn.Embed(
             self.config.vocab_size,
@@ -235,20 +240,28 @@ class QwenModel(nn.Module):
             name='embed_tokens'
         )
         hidden_states = embed_tokens(input_ids)
-        
+
         # Create causal mask if not provided
         if attention_mask is None:
-            attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-            attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
-            attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
-        
+            # For generation with KV cache, we only need to mask new tokens
+            if kv_caches is not None and position_offset > 0:
+                # Only mask for the current position against all previous positions
+                total_len = position_offset + seq_len
+                attention_mask = jnp.zeros((1, 1, seq_len, total_len))
+            else:
+                attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+                attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
+                attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
+
         # Apply decoder layers
+        new_kv_caches = []
         for i in range(self.config.num_hidden_layers):
-            hidden_states = QwenDecoderLayer(self.config, name=f'layers_{i}')(
-                hidden_states, attention_mask
+            layer_kv_cache = kv_caches[i] if kv_caches is not None else None
+            hidden_states, new_kv_cache = QwenDecoderLayer(self.config, name=f'layers_{i}')(
+                hidden_states, attention_mask, layer_kv_cache, position_offset
             )
-        
-        # print("layer")
+            new_kv_caches.append(new_kv_cache)
+
         # Final norm
         hidden_states = RMSNorm(
             self.config.hidden_size,
@@ -256,7 +269,7 @@ class QwenModel(nn.Module):
             self.config.dtype,
             name='norm'
         )(hidden_states)
-        
+
         # LM head
         if self.config.tie_word_embeddings:
             lm_logits = embed_tokens.attend(hidden_states)
@@ -268,8 +281,8 @@ class QwenModel(nn.Module):
                 name='lm_head'
             )
             lm_logits = lm_head(hidden_states)
-        
-        return lm_logits
+
+        return lm_logits, new_kv_caches
 
 
 def convert_hf_to_jax_weights(hf_model, config):
@@ -409,30 +422,60 @@ def main():
     
     # Run inference
     print("\nRunning inference...")
-    
-    # JIT compile the model for better performance on TPU
+
+    # JIT compile functions for better performance on TPU
+    # Prefill: process initial prompt
     @jax.jit
-    def generate_token(params, input_ids):
-        return jax_model.apply(params, input_ids)
-    
-    # Generate tokens
+    def prefill(params, input_ids):
+        return jax_model.apply(params, input_ids, kv_caches=None, position_offset=0)
+
+    # Decode: generate one token at a time with KV cache
+    @jax.jit
+    def decode_step(params, input_id, kv_caches, position):
+        return jax_model.apply(params, input_id, kv_caches=kv_caches, position_offset=position)
+
+    # Generate tokens with KV caching
     max_new_tokens = 50
-    generated_ids = input_ids
-    
-    print("\nGenerating text...")
-    for _ in range(max_new_tokens):
-        logits = generate_token(params, generated_ids)
+
+    print("\nGenerating text (with KV cache optimization)...")
+    start_time = time.time()
+
+    # Prefill phase: process the entire prompt
+    logits, kv_caches = prefill(params, input_ids)
+    next_token_logits = logits[:, -1, :]
+    next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
+    generated_ids = jnp.concatenate([input_ids, next_token_id], axis=1)
+
+    prefill_time = time.time() - start_time
+    decode_start = time.time()
+
+    # Decode phase: generate tokens one at a time
+    tokens_generated = 1
+    for i in range(1, max_new_tokens):
+        # Only process the new token
+        logits, kv_caches = decode_step(params, next_token_id, kv_caches, input_ids.shape[1] + i - 1)
         next_token_logits = logits[:, -1, :]
         next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
         generated_ids = jnp.concatenate([generated_ids, next_token_id], axis=1)
-        
+        tokens_generated += 1
+
         # Check for EOS token
         if tokenizer.eos_token_id and next_token_id[0, 0] == tokenizer.eos_token_id:
             break
-    
+
+    decode_time = time.time() - decode_start
+    total_time = time.time() - start_time
+
     # Decode output
     generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     print(f"\nGenerated text:\n{generated_text}")
+
+    # Performance metrics
+    print(f"\nPerformance:")
+    print(f"  Prefill time: {prefill_time:.3f}s ({input_ids.shape[1]} tokens)")
+    print(f"  Decode time: {decode_time:.3f}s ({tokens_generated} tokens)")
+    print(f"  Total time: {total_time:.3f}s")
+    print(f"  Tokens/sec (decode): {tokens_generated / decode_time:.2f}")
     
     
     # Performance metrics

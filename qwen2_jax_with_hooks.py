@@ -30,7 +30,7 @@ class QwenModelWithActivations(nn.Module):
     layers_to_extract: List[int] = None  # Which layers to extract (None = all)
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, return_activations=True):
+    def __call__(self, input_ids, attention_mask=None, kv_caches=None, position_offset=0, return_activations=True):
         batch_size, seq_len = input_ids.shape
 
         # Token embeddings
@@ -44,18 +44,27 @@ class QwenModelWithActivations(nn.Module):
 
         # Create causal mask if not provided
         if attention_mask is None:
-            attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-            attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
-            attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
+            # For generation with KV cache, we only need to mask new tokens
+            if kv_caches is not None and position_offset > 0:
+                # Only mask for the current position against all previous positions
+                total_len = position_offset + seq_len
+                attention_mask = jnp.zeros((1, 1, seq_len, total_len))
+            else:
+                attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+                attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
+                attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
 
         # Store activations
         activations = {} if return_activations else None
 
-        # Apply decoder layers
+        # Apply decoder layers with KV caching
+        new_kv_caches = []
         for i in range(self.config.num_hidden_layers):
-            hidden_states = QwenDecoderLayer(self.config, name=f'layers_{i}')(
-                hidden_states, attention_mask
+            layer_kv_cache = kv_caches[i] if kv_caches is not None else None
+            hidden_states, new_kv_cache = QwenDecoderLayer(self.config, name=f'layers_{i}')(
+                hidden_states, attention_mask, layer_kv_cache, position_offset
             )
+            new_kv_caches.append(new_kv_cache)
 
             # Extract activation if requested
             if return_activations:
@@ -91,7 +100,7 @@ class QwenModelWithActivations(nn.Module):
         if return_activations:
             return lm_logits, activations
         else:
-            return lm_logits
+            return lm_logits, new_kv_caches
 
 
 def create_model_with_hooks(config: QwenConfig, layers_to_extract: Optional[List[int]] = None):

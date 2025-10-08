@@ -23,6 +23,11 @@ from jax.tree_util import tree_map_with_path
 import flax.linen as nn
 from tqdm.auto import tqdm
 
+from arc24.data_augmentation import (
+    apply_data_augmentation, revert_data_augmentation, get_random_color_map, set_random_seed)
+from arc24.prompting import parse_grid_from_response, print_smallest_prompt, create_prompts_from_task
+from arc24.encoders import create_grid_encoder
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -48,7 +53,7 @@ class ModelConfig:
 class InferenceConfig:
     """Inference pipeline configuration"""
     # Model paths
-    model_path: str = "KathirKs/qwen-2.5-0.5b"
+    model_path: str = "Qwen/Qwen2.5-0.5B"
     
     # Data paths
     dataset_path: str = "arc_data.json"
@@ -281,83 +286,209 @@ class GenerationEngine:
         self.model = model
         self.config = config
     
-    def create_generate_fn(self, mesh: Optional[Mesh] = None):
-        """Create JIT-compiled generation function"""
+    def create_generate_fn(self, mesh: Optional[Mesh] = None, extract_activations: bool = False):
+        """Create JIT-compiled generation function with optional activation extraction"""
         
-        def generate_tokens(params, input_ids, max_new_tokens):
-            """Generate tokens using scan for efficiency"""
-            batch_size = input_ids.shape[0]
+        if extract_activations and self.config.layers_to_extract:
+            # Determine activation dimensions for pre-allocation
+            n_layers = len(self.config.layers_to_extract) * 2  # input and output per layer
+            hidden_size = self.config.model_config.hidden_size if hasattr(self.config, 'model_config') else 896
             
-            def scan_fn(carry, _):
-                generated_ids, position = carry
+            def generate_with_activations_jit(params, input_ids, max_new_tokens):
+                """JIT-compiled generation with activation extraction using scan"""
+                batch_size = input_ids.shape[0]
+                init_len = input_ids.shape[1]
                 
-                # Get sequence up to current position
-                current_seq = lax.dynamic_slice(
-                    generated_ids, (0, 0), (batch_size, position)
+                def scan_fn(carry, _):
+                    generated_ids, position = carry
+                    
+                    # Get sequence up to current position
+                    current_seq = lax.dynamic_slice(
+                        generated_ids, (0, 0), (batch_size, position)
+                    )
+                    
+                    # Forward pass with activations
+                    logits, activations = self.model.apply(
+                        params, current_seq, return_activations=True
+                    )
+                    
+                    # Extract only the last token's activation for each layer
+                    # This reduces memory significantly
+                    last_token_acts = {}
+                    for layer_name, acts in activations.items():
+                        # Get activation at last position [batch, hidden_dim]
+                        last_token_acts[layer_name] = acts[:, -1, :]
+                    
+                    # Greedy sampling
+                    next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
+                    
+                    # Update sequence
+                    generated_ids = lax.dynamic_update_slice(
+                        generated_ids, next_tokens[:, None], (0, position)
+                    )
+                    
+                    return (generated_ids, position + 1), last_token_acts
+                
+                # Initialize
+                max_len = init_len + max_new_tokens
+                generated = jnp.zeros((batch_size, max_len), dtype=jnp.int32)
+                generated = generated.at[:, :init_len].set(input_ids)
+                
+                # Run generation with scan, collecting activations
+                (final_ids, final_pos), all_activations = lax.scan(
+                    scan_fn, (generated, init_len), None, length=max_new_tokens
                 )
                 
-                # Forward pass
-                logits = self.model.apply(params, current_seq)
+                # all_activations is a dict of layer_name -> [max_new_tokens, batch, hidden_dim]
+                # Transpose to [batch, max_new_tokens, hidden_dim] for easier processing
+                transposed_acts = {}
+                for layer_name, acts in all_activations.items():
+                    transposed_acts[layer_name] = jnp.transpose(acts, (1, 0, 2))
                 
-                # Greedy sampling (temp=0)
-                next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
+                return final_ids[:, :final_pos], transposed_acts
+            
+            generate_fn = generate_with_activations_jit
+        else:
+            # Standard generation without activations
+            def generate_tokens(params, input_ids, max_new_tokens):
+                """Generate tokens using scan for efficiency"""
+                batch_size = input_ids.shape[0]
                 
-                # Update sequence
-                generated_ids = lax.dynamic_update_slice(
-                    generated_ids, next_tokens[:, None], (0, position)
+                def scan_fn(carry, _):
+                    generated_ids, position = carry
+                    
+                    # Get sequence up to current position
+                    current_seq = lax.dynamic_slice(
+                        generated_ids, (0, 0), (batch_size, position)
+                    )
+                    
+                    # Forward pass
+                    logits = self.model.apply(params, current_seq)
+                    
+                    # Greedy sampling
+                    next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
+                    
+                    # Update sequence
+                    generated_ids = lax.dynamic_update_slice(
+                        generated_ids, next_tokens[:, None], (0, position)
+                    )
+                    
+                    return (generated_ids, position + 1), None
+                
+                # Initialize
+                init_len = input_ids.shape[1]
+                max_len = init_len + max_new_tokens
+                
+                generated = jnp.zeros((batch_size, max_len), dtype=jnp.int32)
+                generated = generated.at[:, :init_len].set(input_ids)
+                
+                # Run generation
+                (final_ids, final_pos), _ = lax.scan(
+                    scan_fn, (generated, init_len), None, length=max_new_tokens
                 )
                 
-                return (generated_ids, position + 1), None
+                return final_ids[:, :final_pos], None
             
-            # Prepare for scan
-            init_len = input_ids.shape[1]
-            max_len = init_len + max_new_tokens
-            
-            # Initialize with padding
-            generated = jnp.zeros((batch_size, max_len), dtype=jnp.int32)
-            generated = generated.at[:, :init_len].set(input_ids)
-            
-            # Run generation
-            (final_ids, final_pos), _ = lax.scan(
-                scan_fn, (generated, init_len), None, length=max_new_tokens
-            )
-            
-            return final_ids[:, :final_pos]
+            generate_fn = generate_tokens
         
-        # Apply sharding if mesh is provided
+        # Apply sharding and JIT compilation
         if mesh is not None:
             in_shardings = (
-                None,  # params - replicated or custom sharding
+                None,  # params
                 NamedSharding(mesh, P('data', None)),  # input_ids
                 None   # max_new_tokens
             )
-            out_sharding = NamedSharding(mesh, P('data', None))
+            if extract_activations:
+                # Activations dict doesn't get sharded
+                out_shardings = (NamedSharding(mesh, P('data', None)), None)
+            else:
+                out_shardings = (NamedSharding(mesh, P('data', None)), None)
             
             return jax.jit(
-                generate_tokens,
+                generate_fn,
                 in_shardings=in_shardings,
-                out_shardings=out_sharding,
-                static_argnums=(2,)
+                out_shardings=out_shardings
             )
         else:
-            return jax.jit(generate_tokens, static_argnums=(2,))
+            return jax.jit(generate_fn)
     
-    def generate_with_activations(self, params, input_ids, max_new_tokens):
-        """Generate with activation extraction (not JIT-compiled)"""
-        batch_size = input_ids.shape[0]
-        generated = input_ids
-        all_activations = []
+    def create_chunked_generate_fn(self, mesh: Optional[Mesh] = None):
+        """
+        Alternative: Generate in smaller chunks to reduce memory for activations
+        This is useful when extracting activations from very long sequences
+        """
+        chunk_size = 128  # Generate 128 tokens at a time
         
-        for _ in range(max_new_tokens):
-            logits, activations = self.model.apply(
-                params, generated, return_activations=True
-            )
-            all_activations.append(activations)
+        def chunked_generate_with_activations(params, input_ids, max_new_tokens):
+            """Generate in chunks, extracting activations efficiently"""
+            all_generated = input_ids
+            all_activations_list = []
             
-            next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
-            generated = jnp.concatenate([generated, next_tokens[:, None]], axis=1)
+            n_chunks = (max_new_tokens + chunk_size - 1) // chunk_size
+            
+            for chunk_idx in range(n_chunks):
+                tokens_this_chunk = min(chunk_size, max_new_tokens - chunk_idx * chunk_size)
+                
+                # JIT-compiled chunk generation
+                chunk_generated, chunk_activations = self._generate_chunk_jit(
+                    params, all_generated, tokens_this_chunk
+                )
+                
+                all_generated = chunk_generated
+                all_activations_list.append(chunk_activations)
+            
+            # Concatenate activations from all chunks
+            combined_activations = {}
+            if all_activations_list and all_activations_list[0] is not None:
+                for layer_name in all_activations_list[0].keys():
+                    layer_acts = [chunk[layer_name] for chunk in all_activations_list]
+                    combined_activations[layer_name] = jnp.concatenate(layer_acts, axis=1)
+            
+            return all_generated, combined_activations
         
-        return generated, all_activations
+        # Create JIT-compiled chunk generation function
+        self._generate_chunk_jit = jax.jit(
+            self._generate_chunk,
+            static_argnums=(2,)  # max_new_tokens is static
+        )
+        
+        return chunked_generate_with_activations
+    
+    def _generate_chunk(self, params, input_ids, max_new_tokens):
+        """Single chunk generation for chunked approach"""
+        batch_size = input_ids.shape[0]
+        
+        def scan_fn(carry, _):
+            generated_ids, position = carry
+            
+            # Forward pass with activations
+            logits, activations = self.model.apply(
+                params, generated_ids, return_activations=True
+            )
+            
+            # Store last token activations
+            last_token_acts = {}
+            for layer_name, acts in activations.items():
+                last_token_acts[layer_name] = acts[:, -1:, :]  # Keep seq dim
+            
+            # Generate next token
+            next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
+            generated_ids = jnp.concatenate([generated_ids, next_tokens[:, None]], axis=1)
+            
+            return (generated_ids, position + 1), last_token_acts
+        
+        # Run scan
+        (final_ids, _), all_activations = lax.scan(
+            scan_fn, (input_ids, 0), None, length=max_new_tokens
+        )
+        
+        # Stack activations: [steps, batch, 1, hidden] -> [batch, steps, hidden]
+        stacked_acts = {}
+        for layer_name, acts in all_activations.items():
+            acts = acts.squeeze(2)  # Remove singleton seq dimension
+            stacked_acts[layer_name] = jnp.transpose(acts, (1, 0, 2))
+        
+        return final_ids, stacked_acts
 
 
 # ============================================================================
@@ -365,11 +496,10 @@ class GenerationEngine:
 # ============================================================================
 
 class ActivationManager:
-    """Manages extraction and storage of activations"""
+    """Manages extraction and storage of activations - optimized version"""
     
     def __init__(self, config: InferenceConfig):
         self.config = config
-        self.buffer = {}
         self.batch_count = 0
         os.makedirs(config.activations_dir, exist_ok=True)
         
@@ -379,57 +509,89 @@ class ActivationManager:
             'batches': []
         }
     
-    def add_batch(self, activations: List[Dict], batch_info: List[Dict]):
-        """Add a batch of activations to buffer"""
-        for step_idx, step_acts in enumerate(activations):
-            for layer_name, layer_acts in step_acts.items():
-                if layer_name not in self.buffer:
-                    self.buffer[layer_name] = []
-                
-                # Convert to numpy and store with metadata
-                acts_np = np.array(layer_acts)
-                for i, info in enumerate(batch_info):
-                    if i < acts_np.shape[0]:
-                        self.buffer[layer_name].append({
-                            'activation': acts_np[i],
-                            'task_id': info.get('task_id'),
-                            'sample_idx': info.get('idx'),
-                            'step': step_idx
-                        })
+    def save_batch_activations(self, activations: Dict[str, jnp.ndarray], batch_info: List[Dict]):
+        """
+        Save a batch of activations from JIT-compiled generation
         
+        Args:
+            activations: Dict of layer_name -> [batch, seq_len, hidden_dim]
+            batch_info: List of metadata for each sample in batch
+        """
         self.batch_count += 1
-        if self.batch_count % self.config.save_frequency == 0:
-            self.save()
-    
-    def save(self):
-        """Save buffer to disk"""
-        if not self.buffer:
-            return
         
-        for layer_name, activations in self.buffer.items():
+        # Convert to numpy and save immediately to reduce memory pressure
+        for layer_name, acts in activations.items():
+            # acts shape: [batch, seq_len, hidden_dim]
+            acts_np = np.array(acts)
+            
+            # Create structured data with metadata
+            batch_data = []
+            for i, info in enumerate(batch_info):
+                if i < acts_np.shape[0]:
+                    # Store aggregated statistics instead of full activations if needed
+                    # This reduces storage significantly
+                    batch_data.append({
+                        'activation_mean': acts_np[i].mean(axis=0),  # [hidden_dim]
+                        'activation_std': acts_np[i].std(axis=0),    # [hidden_dim]
+                        'activation_max': acts_np[i].max(axis=0),    # [hidden_dim]
+                        'last_token': acts_np[i, -1, :],             # [hidden_dim]
+                        'task_id': info.get('task_id'),
+                        'sample_idx': info.get('idx'),
+                        'seq_len': acts_np.shape[1]
+                    })
+            
+            # Save to disk
             filename = f"{layer_name}_batch_{self.batch_count:06d}.pkl"
             filepath = os.path.join(self.config.activations_dir, filename)
             
             with open(filepath, 'wb') as f:
-                pickle.dump(activations, f)
+                pickle.dump(batch_data, f, protocol=pickle.HIGHEST_PROTOCOL)
             
             self.metadata['batches'].append({
                 'batch': self.batch_count,
                 'layer': layer_name,
                 'file': filename,
-                'samples': len(activations)
+                'samples': len(batch_data)
             })
         
-        self.buffer = {}
-        print(f"Saved activations for batch {self.batch_count}")
+        if self.batch_count % 10 == 0:
+            print(f"Saved activations for batch {self.batch_count}")
+    
+    def save_full_activations(self, activations: Dict[str, jnp.ndarray], batch_info: List[Dict]):
+        """
+        Alternative: Save full activations (more storage but complete data)
+        """
+        self.batch_count += 1
+        
+        for layer_name, acts in activations.items():
+            acts_np = np.array(acts)
+            
+            # Save full activations with compression
+            filename = f"{layer_name}_full_batch_{self.batch_count:06d}.npz"
+            filepath = os.path.join(self.config.activations_dir, filename)
+            
+            # Use numpy's compressed format
+            np.savez_compressed(
+                filepath,
+                activations=acts_np,
+                task_ids=[info.get('task_id') for info in batch_info],
+                sample_indices=[info.get('idx') for info in batch_info]
+            )
+            
+            self.metadata['batches'].append({
+                'batch': self.batch_count,
+                'layer': layer_name,
+                'file': filename,
+                'type': 'full',
+                'shape': acts_np.shape
+            })
     
     def finalize(self):
-        """Save remaining activations and metadata"""
-        self.save()
-        
+        """Save metadata"""
         metadata_path = os.path.join(self.config.activations_dir, 'metadata.json')
         with open(metadata_path, 'w') as f:
             json.dump(self.metadata, f, indent=2)
+        print(f"Saved metadata to {metadata_path}")
 
 
 # ============================================================================

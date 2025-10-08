@@ -352,7 +352,7 @@ def main():
     
     # Load model and tokenizer from HuggingFace
     print("\nLoading Qwen2.5-0.5B model from HuggingFace...")
-    model_name = "Qwen/Qwen2.5-0.5B"
+    model_name = "KathirKs/qwen-2.5-0.5b"
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     hf_model = AutoModelForCausalLM.from_pretrained(

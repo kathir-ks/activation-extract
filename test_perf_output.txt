@@ -1,0 +1,88 @@
+=== Performance Test Started at Wed Oct  8 01:54:22 UTC 2025 ===
+WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.
+======================================================================
+DISTRIBUTED ARC-AGI INFERENCE WITH ACTIVATION EXTRACTION
+======================================================================
+{
+  "output_filepath": "test_outputs/perf_test.json",
+  "activations_dir": "test_activations/perf_test",
+  "model_path": "KathirKs/qwen-2.5-0.5b",
+  "max_model_len": 10240,
+  "grid_encoder": "GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))",
+  "prompt_version": "output-from-examples-v0",
+  "dataset_path": "test_data_small.json",
+  "n_tasks": 1,
+  "max_output_tokens": 100,
+  "predictions_per_task": 1,
+  "temperature": 0.0,
+  "batch_size": 2,
+  "random_seed": null,
+  "mesh_shape": [
+    2,
+    2
+  ],
+  "use_pjit": true,
+  "extract_activations": true,
+  "layers_to_extract": [
+    10,
+    11,
+    12
+  ],
+  "save_every_n_batches": 10,
+  "upload_to_cloud": false,
+  "cloud_bucket": null,
+  "verbose": false
+}
+======================================================================
+Found 4 devices: [TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), TpuDevice(id=1, process_index=0, coords=(1,0,0), core_on_chip=0), TpuDevice(id=2, process_index=0, coords=(0,1,0), core_on_chip=0), TpuDevice(id=3, process_index=0, coords=(1,1,0), core_on_chip=0)]
+Created mesh with shape [2, 2]: Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto))
+Loaded 1 tasks from test_data_small.json
+
+Loading tokenizer from KathirKs/qwen-2.5-0.5b...
+Creating model with activation hooks for layers [10, 11, 12]...
+Loading model weights from KathirKs/qwen-2.5-0.5b...
+
+Sharding model across 4 devices using mesh...
+Target devices: ['TPU_0(process=0,(0,0,0,0))', 'TPU_1(process=0,(1,0,0,0))', 'TPU_2(process=0,(0,1,0,0))', 'TPU_3(process=0,(1,1,0,0))']
+Mesh axes: data=2, model=2
+
+Verifying parameter sharding:
+  ['params']/['embed_tokens']/['embedding']: shape=(151936, 896), sharding=NamedSharding(mesh=Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto)), spec=PartitionSpec(None, 'model'), memory_kind=device)
+  ['params']/['layers_0']/['input_layernorm']/['weight']: shape=(896,), sharding=NamedSharding(mesh=Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto)), spec=PartitionSpec(None,), memory_kind=device)
+  ['params']/['layers_0']/['mlp']/['down_proj']/['kernel']: shape=(4864, 896), sharding=NamedSharding(mesh=Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto)), spec=PartitionSpec(None, 'model'), memory_kind=device)
+
+Creating prompts for 1 tasks...
+Creating prompts:   0%|          | 0/1 [00:00<?, ?it/s]Creating prompts: 100%|██████████| 1/1 [00:00<00:00, 63.62it/s]
+Created 1 prompts
+Tokenizing prompts...
+Tokenizing:   0%|          | 0/1 [00:00<?, ?it/s]Tokenizing: 100%|██████████| 1/1 [00:00<00:00, 25.42it/s]
+
+Distributing data across 4 devices...
+Processing 1 batches...
+Creating mesh-aware generation function...
+Inference batches:   0%|          | 0/1 [00:00<?, ?it/s]Inference batches:   0%|          | 0/1 [00:01<?, ?it/s]
+
+Sharding verification:
+  Input shape: (8, 453)
+  Input sharding: NamedSharding(mesh=Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto)), spec=PartitionSpec('data', None), memory_kind=device)
+  Params sharding: NamedSharding(mesh=Mesh('data': 2, 'model': 2, axis_types=(Auto, Auto)), spec=PartitionSpec(None, 'model'), memory_kind=device)
+jax.errors.SimplifiedTraceback: For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/kathirks_gc/torch_xla/qwen/distributed_inference_with_activations.py", line 789, in <module>
+    inference_main_distributed()
+  File "/home/kathirks_gc/torch_xla/qwen/distributed_inference_with_activations.py", line 703, in inference_main_distributed
+    generated_ids = distributed_generate(
+  File "/home/kathirks_gc/torch_xla/qwen/distributed_inference_with_activations.py", line 405, in distributed_generate
+    _, generated_ids = lax.fori_loop(
+TypeError: scan body function carry input and carry output must have equal types, but they differ:
+
+The input carry component loop_carry[1][1] has type int32[8,453] but the corresponding output carry component has type int32[8,454], so the shapes do not match.
+
+Revise the function so that all output types match the corresponding input types.
+
+=== Performance Test Completed at Wed Oct  8 01:54:52 UTC 2025 ===
+Duration: 30 seconds
+Log saved to: logs/perf_test_20251008_015422.log

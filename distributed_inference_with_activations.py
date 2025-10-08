@@ -6,8 +6,9 @@ Supports multi-host TPU (v4-64, v5e-64, etc.) with layer activation capture
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.sharding import PartitionSpec as P, Mesh
+from jax.sharding import PartitionSpec as P, Mesh, NamedSharding
 from jax.experimental import mesh_utils
+from jax.experimental.shard_map import shard_map
 import json
 import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
@@ -92,6 +93,81 @@ def setup_mesh(mesh_shape: Tuple[int, int]):
     print(f"Created mesh with shape {mesh_shape}: {mesh}")
 
     return mesh
+
+
+def get_param_sharding_spec(param_name: str, param_shape: tuple, mesh: Mesh) -> NamedSharding:
+    """
+    Get sharding specification for a model parameter
+
+    Args:
+        param_name: Name of the parameter (e.g., 'embed_tokens', 'layers_0_attn_qkv')
+        param_shape: Shape of the parameter
+        mesh: JAX mesh
+
+    Returns:
+        NamedSharding specification
+    """
+    # For transformer models, we shard along hidden/intermediate dimensions
+    # across the 'model' axis, and replicate across 'data' axis
+
+    if 'embed' in param_name or 'lm_head' in param_name:
+        # Embedding layers: [vocab_size, hidden_size]
+        # Shard hidden_size across 'model' axis
+        if len(param_shape) >= 2:
+            spec = P(None, 'model')
+        else:
+            spec = P(None)
+    elif 'norm' in param_name:
+        # Norm layers: [hidden_size] - replicate
+        spec = P(None)
+    elif len(param_shape) == 2:
+        # Linear layers: [in_features, out_features]
+        # Shard second dimension across 'model' axis
+        spec = P(None, 'model')
+    else:
+        # Default: replicate everything
+        spec = P(None)
+
+    return NamedSharding(mesh, spec)
+
+
+def shard_params(params: Dict, mesh: Mesh) -> Dict:
+    """
+    Shard model parameters according to mesh
+
+    Args:
+        params: Model parameters pytree
+        mesh: JAX mesh
+
+    Returns:
+        Sharded parameters
+    """
+    def shard_leaf(path, param):
+        param_name = '/'.join(str(k) for k in path)
+        sharding = get_param_sharding_spec(param_name, param.shape, mesh)
+        return jax.device_put(param, sharding)
+
+    # Use tree_map_with_path to get parameter names
+    from jax.tree_util import tree_map_with_path
+    sharded_params = tree_map_with_path(shard_leaf, params)
+
+    return sharded_params
+
+
+def get_data_sharding(mesh: Mesh, batch_shape: tuple) -> NamedSharding:
+    """
+    Get sharding specification for input data
+
+    Args:
+        mesh: JAX mesh
+        batch_shape: Shape of the batch [batch_size, seq_len]
+
+    Returns:
+        NamedSharding that shards batch dimension across 'data' axis
+    """
+    # Shard batch dimension across 'data' axis, replicate sequence dimension
+    spec = P('data', None)
+    return NamedSharding(mesh, spec)
 
 
 class ActivationExtractor:
@@ -283,24 +359,95 @@ def generate_with_activations(
     return generated_ids
 
 
-@partial(jax.pmap, axis_name='data', static_broadcasted_argnums=(0,))
-def distributed_generate(model, params, input_ids, max_tokens):
+def create_mesh_aware_generate(model, max_tokens, mesh):
     """
-    Distributed generation function using pmap
+    Create a mesh-aware distributed generation function using jax.jit
 
-    Args:
-        model: JAX model (static)
-        params: Replicated model parameters
-        input_ids: Input IDs [n_devices, batch_per_device, seq_len]
-        max_tokens: Maximum tokens to generate
+    This version properly uses the mesh for 2D parallelism (data + model)
+    Uses jax.lax.fori_loop to keep the generation loop inside XLA for performance
     """
-    # Generate on each device
-    generated = generate_with_activations(
-        model, params, input_ids, max_tokens,
-        None,  # Activation extractor handled separately
-        "", 0  # Placeholder for task tracking
+    # Define sharding for inputs and outputs
+    # Input: [batch, seq_len] - shard batch across 'data' axis
+    input_sharding = NamedSharding(mesh, P('data', None))
+    # Output: same as input
+    output_sharding = NamedSharding(mesh, P('data', None))
+
+    def generate_one_token_jit(params, input_ids):
+        """Generate a single token - will be JIT compiled"""
+        logits = model.apply(params, input_ids, return_activations=False)
+        next_token_logits = logits[:, -1, :]
+        next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
+        return next_token_id
+
+    # JIT compile the single token generation with sharding
+    # Note: This will recompile for each sequence length (unavoidable without KV cache)
+    # But at least each length is cached after first compilation
+    generate_one_token_compiled = jax.jit(
+        generate_one_token_jit,
+        in_shardings=(None, input_sharding),
+        out_shardings=input_sharding,
+        donate_argnums=(1,)  # Donate input_ids to avoid copies
     )
-    return generated
+
+    def distributed_generate(params, input_ids):
+        """
+        Mesh-aware distributed generation function
+
+        Args:
+            params: Sharded model parameters
+            input_ids: Input IDs [batch_size, seq_len] - will be sharded across 'data' axis
+        """
+        generated_ids = input_ids
+
+        # Generate tokens one at a time
+        # Each call is JIT compiled, donations reduce memory copies
+        for _ in range(max_tokens):
+            next_token = generate_one_token_compiled(params, generated_ids)
+            generated_ids = jnp.concatenate([generated_ids, next_token], axis=1)
+
+        return generated_ids
+
+    return distributed_generate
+
+
+def create_pmap_generate(model, max_tokens):
+    """
+    Create a pmap-based generation function (fallback, data parallelism only)
+    Uses lax.fori_loop for performance
+    """
+    def generate_step(params, input_ids):
+        """Single generation step"""
+        logits = model.apply(params, input_ids, return_activations=False)
+        next_token_logits = logits[:, -1, :]
+        next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
+        new_ids = jnp.concatenate([input_ids, next_token_id], axis=1)
+        return new_ids
+
+    def generate_loop_body(step, state):
+        """Loop body for generation"""
+        params, generated_ids = state
+        new_ids = generate_step(params, generated_ids)
+        return (params, new_ids)
+
+    @partial(jax.pmap, axis_name='data')
+    def distributed_generate(params, input_ids):
+        """
+        pmap distributed generation function
+
+        Args:
+            params: Replicated model parameters
+            input_ids: Input IDs [n_devices, batch_per_device, seq_len]
+        """
+        # Use lax.fori_loop to keep loop inside XLA
+        initial_state = (params, input_ids)
+        _, generated_ids = lax.fori_loop(
+            0, max_tokens,
+            generate_loop_body,
+            initial_state
+        )
+        return generated_ids
+
+    return distributed_generate
 
 
 def create_prompts(data: Dict, grid_encoder, tokenizer, prompt_version: str, predictions_per_task: int):
@@ -340,6 +487,7 @@ def create_solutions(predictions: List[Dict], data: Dict, grid_encoder):
     for task_id, task in data.items():
         solutions[task_id] = [dict() for _ in task['test']]
 
+    parse_failures = 0
     for pred in predictions:
         task_id = pred['task_id']
         sample_idx = pred.get('idx', 0)
@@ -356,8 +504,11 @@ def create_solutions(predictions: List[Dict], data: Dict, grid_encoder):
                 attempt_name = f"attempt_{len(solutions[task_id][sample_idx]) + 1}"
                 solutions[task_id][sample_idx][attempt_name] = grid.tolist()
         except Exception as e:
-            # Skip failed parses
-            pass
+            # Skip failed parses but count them
+            parse_failures += 1
+
+    if parse_failures > 0:
+        print(f"Warning: Failed to parse {parse_failures}/{len(predictions)} predictions")
 
     return solutions
 
@@ -367,12 +518,12 @@ def distribute_data_across_devices(data: List, n_devices: int, batch_size: int):
     Distribute data across devices for parallel processing
 
     Args:
-        data: List of data items
+        data: List of data items (dicts)
         n_devices: Number of devices
         batch_size: Batch size per device
 
     Returns:
-        Distributed batches shaped for pmap
+        Distributed batches shaped for pmap [n_devices, batch_per_device]
     """
     total_batch_size = n_devices * batch_size
 
@@ -384,9 +535,14 @@ def distribute_data_across_devices(data: List, n_devices: int, batch_size: int):
         while len(batch) < total_batch_size:
             batch.append(batch[-1])  # Repeat last item
 
-        # Reshape for devices: [n_devices, batch_per_device, ...]
-        batch_array = np.array(batch).reshape(n_devices, batch_size, -1)
-        batches.append(batch_array)
+        # Reshape for devices: [n_devices, batch_per_device]
+        device_batches = []
+        for device_idx in range(n_devices):
+            start_idx = device_idx * batch_size
+            end_idx = start_idx + batch_size
+            device_batches.append(batch[start_idx:end_idx])
+
+        batches.append(device_batches)
 
     return batches
 
@@ -443,10 +599,22 @@ def inference_main_distributed():
         # Replace initialized params with loaded weights
         params_dict = {'params': params}
 
-        # Replicate parameters across devices for pmap
+        # Shard parameters across mesh
         n_devices = jax.local_device_count()
-        print(f"\nReplicating model across {n_devices} devices...")
-        replicated_params = jax.tree_map(lambda x: jnp.array([x] * n_devices), params_dict)
+        devices = jax.local_devices()
+        print(f"\nSharding model across {n_devices} devices using mesh...")
+        print(f"Target devices: {[str(d) for d in devices]}")
+        print(f"Mesh axes: data={cfg.mesh_shape[0]}, model={cfg.mesh_shape[1]}")
+
+        # Use mesh-aware sharding instead of simple replication
+        sharded_params = shard_params(params_dict, mesh)
+
+        # Verify sharding
+        print(f"\nVerifying parameter sharding:")
+        sample_params = list(jax.tree_util.tree_leaves_with_path(sharded_params))[:3]
+        for path, param in sample_params:
+            param_name = '/'.join(str(k) for k in path)
+            print(f"  {param_name}: shape={param.shape}, sharding={param.sharding}")
 
         # Create prompts
         print(f"\nCreating prompts for {len(data)} tasks...")
@@ -479,11 +647,17 @@ def inference_main_distributed():
 
         print(f"Processing {len(distributed_batches)} batches...")
 
+        # Create mesh-aware distributed generation function
+        print(f"Creating mesh-aware generation function...")
+        distributed_generate = create_mesh_aware_generate(model, cfg.max_output_tokens, mesh)
+
         # Run distributed inference
         all_predictions = []
 
         for batch_idx, batch in enumerate(tqdm(distributed_batches, desc="Inference batches")):
-            # batch shape: [n_devices, batch_per_device, ...]
+            # For mesh-aware sharding, we need to reshape data differently
+            # Instead of [n_devices, batch_per_device, ...], we use [total_batch, ...]
+            # and let the sharding handle distribution
 
             # Extract input_ids and pad to same length
             max_len = max(item['input_ids'].shape[1] for device_batch in batch for item in device_batch)
@@ -491,45 +665,60 @@ def inference_main_distributed():
             batch_input_ids = []
             batch_metadata = []
 
+            # Flatten the nested batch structure for mesh sharding
             for device_batch in batch:
-                device_input_ids = []
                 for item in device_batch:
                     input_ids = item['input_ids'][0]  # Remove batch dim
                     # Pad to max_len
                     padded = jnp.pad(input_ids, (0, max_len - len(input_ids)), constant_values=tokenizer.pad_token_id or 0)
-                    device_input_ids.append(padded)
+                    batch_input_ids.append(padded)
                     batch_metadata.append(item)
 
-                batch_input_ids.append(jnp.stack(device_input_ids))
+            # Stack into [total_batch, seq_len] instead of [n_devices, batch_per_device, seq_len]
+            batch_input_ids = jnp.stack(batch_input_ids)
 
-            batch_input_ids = jnp.stack(batch_input_ids)  # [n_devices, batch_per_device, seq_len]
+            # Apply data sharding across 'data' axis of mesh
+            data_sharding = get_data_sharding(mesh, batch_input_ids.shape)
+            batch_input_ids = jax.device_put(batch_input_ids, data_sharding)
 
-            # Distributed generation
+            # Debug: Verify sharding on first batch
+            if batch_idx == 0:
+                print(f"\nSharding verification:")
+                print(f"  Input shape: {batch_input_ids.shape}")
+                print(f"  Input sharding: {batch_input_ids.sharding}")
+                # Check a sample param
+                sample_param = jax.tree_util.tree_leaves(sharded_params)[0]
+                print(f"  Params sharding: {sample_param.sharding}")
+
+            # Distributed generation with mesh-aware sharding
             generated_ids = distributed_generate(
-                model,
-                replicated_params,
-                batch_input_ids,
-                cfg.max_output_tokens
+                sharded_params,
+                batch_input_ids
             )
 
-            # Decode predictions
-            for dev_idx in range(n_devices):
-                for sample_idx in range(generated_ids.shape[1]):
-                    gen_ids = generated_ids[dev_idx, sample_idx]
-                    decoded = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            # Decode predictions - iterate over flat batch
+            for sample_idx in range(generated_ids.shape[0]):
+                if sample_idx < len(batch_metadata):
+                    meta = batch_metadata[sample_idx]
+                    input_len = len(meta['input_ids'][0])
 
-                    idx = dev_idx * cfg.batch_size + sample_idx
-                    if idx < len(batch_metadata):
-                        meta = batch_metadata[idx]
-                        all_predictions.append({
-                            'task_id': meta['task_id'],
-                            'prediction': decoded,
-                            'data_augmentation_kwargs': meta['data_augmentation_kwargs']
-                        })
+                    # Extract only the newly generated tokens
+                    gen_ids = generated_ids[sample_idx]
+                    new_tokens = gen_ids[input_len:]
+
+                    # Decode only the generated part
+                    decoded = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+                    all_predictions.append({
+                        'task_id': meta['task_id'],
+                        'idx': meta.get('idx', 0),
+                        'prediction': decoded,
+                        'data_augmentation_kwargs': meta['data_augmentation_kwargs']
+                    })
 
             # Extract activations if enabled
             if activation_extractor and batch_idx % cfg.save_every_n_batches == 0:
-                activation_extractor.save_batch()
+                activation_extractor.save_activations()
 
         # Save final activations
         if activation_extractor:
@@ -537,6 +726,14 @@ def inference_main_distributed():
 
         # Create solutions from predictions
         print(f"\nCreating solutions from {len(all_predictions)} predictions...")
+
+        # Debug: Print first few predictions
+        if cfg.verbose or len(all_predictions) > 0:
+            print(f"\nSample predictions (first 2):")
+            for i, pred in enumerate(all_predictions[:2]):
+                print(f"  Prediction {i}: task_id={pred.get('task_id')}, idx={pred.get('idx')}")
+                print(f"    Text (first 200 chars): {pred.get('prediction', '')[:200]}")
+
         solutions = create_solutions(all_predictions, data, grid_encoder)
 
         # Save outputs

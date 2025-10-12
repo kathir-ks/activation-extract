@@ -15,8 +15,7 @@ from tqdm.auto import tqdm
 from itertools import islice, product
 
 from transformers import AutoTokenizer
-from qwen2_jax import QwenConfig, convert_hf_to_jax_weights
-from qwen2_jax_fixed import QwenModelFixed, generate_with_kv_cache_timed
+from qwen2_jax import QwenModel, QwenConfig, convert_hf_to_jax_weights
 from transformers import AutoModelForCausalLM
 import torch
 
@@ -31,12 +30,12 @@ class ARCConfig:
     """Configuration for ARC-AGI inference"""
     output_filepath: str = 'submission.json'
     # Model
-    model_path: str = "KathirKs/qwen-2.5-0.5b"  # Default to HF model
+    model_path: str = "Qwen/Qwen2.5-0.5B"  # Default to HF model
     max_model_len: int = 10240
     grid_encoder: str = 'GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))'
     prompt_version: str = 'output-from-examples-v0'
     # Dataset
-    dataset_path: str = 'test_data_small.json'
+    dataset_path: str = 'arc_data.json'
     n_tasks: Optional[int] = None
     # Inference params
     max_output_tokens: int = 1100
@@ -79,8 +78,8 @@ def load_jax_model_and_tokenizer(model_path: str, config: QwenConfig):
         trust_remote_code=True
     )
 
-    # Initialize JAX model with fixed cache
-    jax_model = QwenModelFixed(config)
+    # Initialize JAX model
+    jax_model = QwenModel(config)
 
     # Create dummy input for initialization
     dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
@@ -129,46 +128,71 @@ def create_prompts(data: Dict, grid_encoder, tokenizer, prompt_version: str, pre
     return prompts
 
 
+def generate_tokens_jax(model, params, input_ids, max_tokens: int = 50):
+    """Generate tokens using JAX model"""
+    generated_ids = input_ids
+
+    for _ in range(max_tokens):
+        logits = model.apply(params, generated_ids)
+        next_token_logits = logits[:, -1, :]
+        next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
+        generated_ids = jnp.concatenate([generated_ids, next_token_id], axis=1)
+
+        # Simple stopping condition (can be improved)
+        if generated_ids.shape[1] > input_ids.shape[1] + max_tokens:
+            break
+
+    return generated_ids
+
+
 def generate_outputs_with_batches(model, params, tokenizer, prompts: List[str],
-                                batch_size: int = 1, max_output_tokens: int = 1100):
-    """
-    Generate outputs using JAX model with fixed KV cache
-
-    Uses optimized KV-cached generation from qwen2_jax_fixed.py.
-    Processing is sequential but uses JIT-compiled prefill/decode functions.
-    """
+                                batch_size: int = 8, max_output_tokens: int = 1100):
+    """Generate outputs using JAX model in batches"""
     outputs = []
-    print(f'Generating outputs for {len(prompts)} prompts (KV-cached, JIT prefill/decode)')
+    print(f'Generating outputs with batch_size={batch_size}, there are {len(prompts)} prompts')
 
-    for prompt in tqdm(prompts, desc='Generating outputs'):
-        # Tokenize single prompt
-        inputs = tokenizer(prompt, return_tensors="np", truncation=True, max_length=2048)
-        input_ids = jnp.array(inputs['input_ids'])
-        input_len = input_ids.shape[1]
+    for i in tqdm(range(0, len(prompts), batch_size), desc='Generating outputs with batches'):
+        batch_prompts = prompts[i:i+batch_size]
 
-        # Generate with KV cache (JIT-compiled prefill and decode functions)
-        generated_ids, _ = generate_with_kv_cache_timed(
-            model, params, input_ids,
-            max_tokens=max_output_tokens,
-            temperature=0.0,
-            tokenizer=tokenizer
-        )
+        # Tokenize batch
+        batch_inputs = []
+        for prompt in batch_prompts:
+            inputs = tokenizer(prompt, return_tensors="np", truncation=True, max_length=2048)
+            batch_inputs.append(jnp.array(inputs['input_ids']))
 
-        # Extract only the generated part
-        generated_part = generated_ids[0, input_len:]  # [0] to get first (only) batch item
+        # Pad sequences to same length
+        max_len = max(seq.shape[1] for seq in batch_inputs)
+        padded_inputs = []
+        for seq in batch_inputs:
+            pad_width = max_len - seq.shape[1]
+            if pad_width > 0:
+                seq = jnp.pad(seq, ((0, 0), (0, pad_width)), constant_values=tokenizer.pad_token_id or 0)
+            padded_inputs.append(seq)
 
-        # Convert to CPU and decode
-        generated_text = tokenizer.decode(np.array(generated_part), skip_special_tokens=True)
+        batch_input_ids = jnp.concatenate(padded_inputs, axis=0)
 
-        # Mock output object to match original interface
-        output = type('obj', (object,), {
-            'outputs': [type('obj', (object,), {
-                'text': generated_text,
-                'cumulative_logprob': 0.0,  # Placeholder
-                'token_ids': np.array(generated_part).tolist()
-            })()]
-        })()
-        outputs.append(output)
+        # Generate outputs
+        generated_ids = generate_tokens_jax(model, params, batch_input_ids, max_output_tokens)
+
+        # Decode outputs
+        for j, gen_ids in enumerate(generated_ids):
+            if j < len(batch_prompts):  # Handle case where batch is not full
+                # Extract only the generated part
+                input_len = batch_inputs[j].shape[1]
+                generated_part = gen_ids[input_len:]
+
+                # Convert to CPU and decode
+                generated_text = tokenizer.decode(np.array(generated_part), skip_special_tokens=True)
+
+                # Mock output object to match original interface
+                output = type('obj', (object,), {
+                    'outputs': [type('obj', (object,), {
+                        'text': generated_text,
+                        'cumulative_logprob': 0.0,  # Placeholder
+                        'token_ids': np.array(generated_part).tolist()
+                    })()]
+                })()
+                outputs.append(output)
 
     return outputs
 
@@ -289,7 +313,7 @@ def inference_main():
     if cfg.verbose:
         print_smallest_prompt(prompts)
 
-    # Generate outputs with KV-cached generation
+    # Generate outputs
     outputs = generate_outputs_with_batches(
         model, params, tokenizer, prompts,
         batch_size=cfg.batch_size, max_output_tokens=cfg.max_output_tokens)

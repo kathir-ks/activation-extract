@@ -34,8 +34,86 @@ from arc24.prompting import parse_grid_from_response, print_smallest_prompt, cre
 from arc24.encoders import create_grid_encoder
 
 
-# Note: KV caching is handled natively by the model (qwen2_jax.py)
-# Each layer returns (k, v) tuples that are concatenated across generation steps
+@dataclass
+class KVCache:
+    """
+    Key-Value cache for transformer attention
+    Stores keys and values for all layers to avoid recomputation
+    """
+    keys: jnp.ndarray  # [batch, n_layers, n_heads, seq_len, head_dim]
+    values: jnp.ndarray  # [batch, n_layers, n_heads, seq_len, head_dim]
+    cache_position: int  # Current position in cache
+    
+    @classmethod
+    def create_empty(cls, batch_size: int, n_layers: int, n_heads: int, 
+                     head_dim: int, max_seq_len: int, dtype=jnp.float32):
+        """Create an empty KV cache"""
+        keys = jnp.zeros((batch_size, n_layers, n_heads, max_seq_len, head_dim), dtype=dtype)
+        values = jnp.zeros((batch_size, n_layers, n_heads, max_seq_len, head_dim), dtype=dtype)
+        return cls(keys=keys, values=values, cache_position=0)
+    
+    def update(self, layer_idx: int, new_keys: jnp.ndarray, new_values: jnp.ndarray):
+        """
+        Update cache with new keys/values for a specific layer
+        
+        Args:
+            layer_idx: Layer index to update
+            new_keys: [batch, n_heads, new_seq_len, head_dim]
+            new_values: [batch, n_heads, new_seq_len, head_dim]
+        """
+        batch_size, n_heads, new_seq_len, head_dim = new_keys.shape
+        start_pos = self.cache_position
+        end_pos = start_pos + new_seq_len
+        
+        # Update keys and values at current position
+        keys = self.keys.at[:, layer_idx, :, start_pos:end_pos, :].set(new_keys)
+        values = self.values.at[:, layer_idx, :, start_pos:end_pos, :].set(new_values)
+        
+        return KVCache(keys=keys, values=values, cache_position=end_pos)
+    
+    def get_layer_cache(self, layer_idx: int):
+        """Get cached keys and values for a specific layer up to current position"""
+        keys = self.keys[:, layer_idx, :, :self.cache_position, :]
+        values = self.values[:, layer_idx, :, :self.cache_position, :]
+        return keys, values
+
+
+@dataclass
+class RoPECache:
+    """
+    Precomputed Rotary Position Embeddings cache
+    Stores cos/sin values for all positions to avoid recomputation
+    """
+    cos: jnp.ndarray  # [max_seq_len, head_dim]
+    sin: jnp.ndarray  # [max_seq_len, head_dim]
+    
+    @classmethod
+    def create(cls, max_seq_len: int, head_dim: int, base: float = 10000.0, dtype=jnp.float32):
+        """Create RoPE cache with precomputed values"""
+        # Compute frequency for each dimension pair
+        inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+        
+        # Compute position indices
+        positions = jnp.arange(max_seq_len, dtype=jnp.float32)
+        
+        # Compute outer product: [seq_len, head_dim/2]
+        freqs = jnp.outer(positions, inv_freq)
+        
+        # Compute cos and sin, then interleave to match head_dim
+        cos = jnp.cos(freqs)
+        sin = jnp.sin(freqs)
+        
+        # Interleave: [seq_len, head_dim/2] -> [seq_len, head_dim]
+        cos = jnp.repeat(cos, 2, axis=-1)
+        sin = jnp.repeat(sin, 2, axis=-1)
+        
+        return cls(cos=cos.astype(dtype), sin=sin.astype(dtype))
+    
+    def get_rope_values(self, start_pos: int, seq_len: int):
+        """Get RoPE cos/sin values for a sequence starting at start_pos"""
+        cos = self.cos[start_pos:start_pos + seq_len]
+        sin = self.sin[start_pos:start_pos + seq_len]
+        return cos, sin
 
 
 @dataclass
@@ -128,8 +206,14 @@ def shard_params(params: Dict, mesh: Mesh) -> Dict:
     return sharded_params
 
 
-# KV cache sharding is handled per-layer in the model
-# Each layer's cache is a tuple (k, v) where k and v are [batch, n_heads, seq_len, head_dim]
+def get_kv_cache_sharding(mesh: Mesh, cache_shape: tuple) -> NamedSharding:
+    """
+    Get sharding specification for KV cache
+    Shape: [batch, n_layers, n_heads, seq_len, head_dim]
+    Shard: batch across 'data', n_heads across 'model'
+    """
+    spec = P('data', None, 'model', None, None)
+    return NamedSharding(mesh, spec)
 
 
 def get_data_sharding(mesh: Mesh, batch_shape: tuple) -> NamedSharding:
@@ -245,97 +329,109 @@ def create_model_with_activation_hooks(config: QwenConfig, layers_to_extract: Li
     return model
 
 
-# RoPE is applied natively in qwen2_jax.py using apply_rotary_pos_emb()
-
-
-def create_optimized_generate_fn(model, config: DistributedARCConfig, mesh: Mesh,
-                                 model_config: QwenConfig,
-                                 extract_activations: bool = False,
-                                 activation_extractor = None):
+def apply_rope(q: jnp.ndarray, k: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray):
     """
-    Create optimized generation function with KV cache and optional activation extraction
-    Separates prefill and decode phases for better performance
-    Note: RoPE cache is built into the model (qwen2_jax.py QwenAttention.setup())
-
+    Apply Rotary Position Embeddings using cached cos/sin values
+    
     Args:
-        model: Model instance (QwenModel or QwenModelWithActivations)
-        config: Distributed inference config
-        mesh: JAX mesh for sharding
-        model_config: Qwen model config
-        extract_activations: Whether to extract activations during generation
-        activation_extractor: ActivationExtractor instance (if extract_activations=True)
+        q, k: Query and key tensors [batch, n_heads, seq_len, head_dim]
+        cos, sin: Cached RoPE values [seq_len, head_dim]
     """
+    # Expand cos/sin to match q/k shape
+    cos = cos[None, None, :, :]  # [1, 1, seq_len, head_dim]
+    sin = sin[None, None, :, :]
+    
+    # Rotate q and k
+    # Split into even and odd dimensions for rotation
+    q_even = q[..., ::2]
+    q_odd = q[..., 1::2]
+    k_even = k[..., ::2]
+    k_odd = k[..., 1::2]
+    
+    # Apply rotation
+    q_rotated_even = q_even * cos[..., ::2] - q_odd * sin[..., ::2]
+    q_rotated_odd = q_even * sin[..., 1::2] + q_odd * cos[..., 1::2]
+    k_rotated_even = k_even * cos[..., ::2] - k_odd * sin[..., ::2]
+    k_rotated_odd = k_even * sin[..., 1::2] + k_odd * cos[..., 1::2]
+    
+    # Interleave back
+    q_rotated = jnp.stack([q_rotated_even, q_rotated_odd], axis=-1).reshape(q.shape)
+    k_rotated = jnp.stack([k_rotated_even, k_rotated_odd], axis=-1).reshape(k.shape)
+    
+    return q_rotated, k_rotated
 
+
+def create_optimized_generate_fn(model, config: DistributedARCConfig, mesh: Mesh, 
+                                 model_config: QwenConfig):
+    """
+    Create optimized generation function with KV cache and RoPE cache
+    Separates prefill and decode phases for better performance
+    """
+    # Get model dimensions
+    n_layers = model_config.num_hidden_layers
+    n_heads = model_config.num_attention_heads
+    head_dim = model_config.hidden_size // n_heads
+    max_seq_len = config.max_model_len
+    
+    # Create RoPE cache if enabled
+    rope_cache = None
+    if config.use_rope_cache:
+        rope_cache = RoPECache.create(
+            max_seq_len=max_seq_len,
+            head_dim=head_dim,
+            base=model_config.rope_theta if hasattr(model_config, 'rope_theta') else 10000.0,
+            dtype=jnp.float32
+        )
+        print(f"Created RoPE cache for {max_seq_len} positions")
+    
     # Define sharding specs
     input_sharding = NamedSharding(mesh, P('data', None))
     output_sharding = NamedSharding(mesh, P('data', None))
-
+    
     # Prefill function: process input prompt and initialize KV cache
-    def prefill_fn(params, input_ids, kv_caches):
+    def prefill_fn(params, input_ids, kv_cache):
         """
         Prefill phase: process entire input sequence
-        Returns: logits, updated kv_caches (list of per-layer caches)
+        Returns: logits, updated kv_cache
         """
         batch_size, seq_len = input_ids.shape
-
-        # Forward pass - model returns logits and new_kv_caches
-        # Always use return_activations=False during prefill for speed
-        # Activations are typically only needed during decode (for generated tokens)
-        if hasattr(model, 'layers_to_extract'):
-            # QwenModelWithActivations
-            logits, new_kv_caches = model.apply(
+        
+        # Forward pass with KV cache
+        if config.use_kv_cache:
+            logits = model.apply(
                 params, input_ids,
-                kv_caches=kv_caches,
-                position_offset=0,
+                cache=kv_cache,
+                use_cache=True,
                 return_activations=False
             )
         else:
-            # QwenModel - no return_activations parameter
-            logits, new_kv_caches = model.apply(
-                params, input_ids,
-                kv_caches=kv_caches,
-                position_offset=0
-            )
-
-        return logits, new_kv_caches
-
+            logits = model.apply(params, input_ids, return_activations=False)
+        
+        return logits, kv_cache
+    
     # Decode function: generate one token using KV cache
-    def decode_step_fn(params, input_ids, kv_caches, position, extract_acts=False):
+    def decode_step_fn(params, input_ids, kv_cache, rope_cache_obj):
         """
         Decode step: generate one token using cached KV
         input_ids: [batch, 1] - single new token
-        Returns: next_token_id, updated kv_caches, activations (if extract_acts=True)
+        Returns: next_token_id, updated kv_cache
         """
         # Forward pass with cache (only processes new token)
-        if hasattr(model, 'layers_to_extract') and extract_acts:
-            # QwenModelWithActivations - extract activations
-            logits, new_kv_caches, activations = model.apply(
+        if config.use_kv_cache:
+            logits = model.apply(
                 params, input_ids,
-                kv_caches=kv_caches,
-                position_offset=position,
-                return_activations=True
-            )
-        elif hasattr(model, 'layers_to_extract'):
-            # QwenModelWithActivations - no activation extraction
-            logits, new_kv_caches = model.apply(
-                params, input_ids,
-                kv_caches=kv_caches,
-                position_offset=position,
+                cache=kv_cache,
+                cache_position=kv_cache.cache_position if kv_cache else 0,
+                rope_cache=rope_cache_obj,
+                use_cache=True,
                 return_activations=False
             )
-            activations = None
         else:
-            # QwenModel - no return_activations parameter
-            logits, new_kv_caches = model.apply(
-                params, input_ids,
-                kv_caches=kv_caches,
-                position_offset=position
-            )
-            activations = None
-
+            logits = model.apply(params, input_ids, return_activations=False)
+        
         # Sample next token (greedy or sampling based on temperature)
         next_token_logits = logits[:, -1, :]
-
+        
         if config.temperature == 0.0:
             # Greedy decoding
             next_token = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
@@ -345,8 +441,8 @@ def create_optimized_generate_fn(model, config: DistributedARCConfig, mesh: Mesh
             next_token = jax.random.categorical(
                 jax.random.PRNGKey(0), scaled_logits, axis=-1
             ).reshape(-1, 1)
-
-        return next_token, new_kv_caches, activations
+        
+        return next_token, kv_cache
     
     # Compile prefill if enabled
     if config.compile_prefill:
@@ -358,110 +454,85 @@ def create_optimized_generate_fn(model, config: DistributedARCConfig, mesh: Mesh
         )
         print("Compiled prefill function")
     
-    # Note: We don't JIT compile decode_step_fn separately here because
-    # it will be traced inside the scan loop with traced position values
-    # The entire generate_with_cache function (including the scan) will be JIT compiled
-    print("Decode function ready (will be JIT compiled as part of generation)")
+    # Compile decode step
+    decode_step_fn = jax.jit(
+        decode_step_fn,
+        in_shardings=(None, input_sharding, None, None),
+        out_shardings=(input_sharding, None),
+        donate_argnums=(2,)  # Donate cache
+    )
+    print("Compiled decode function")
     
-    def generate_with_cache(params, input_ids, batch_metadata=None):
+    def generate_with_cache(params, input_ids):
         """
-        Full generation with KV cache optimization and optional activation extraction
-
+        Full generation with KV cache optimization
+        
         Args:
             params: Model parameters (sharded)
             input_ids: Input tokens [batch, seq_len]
-            batch_metadata: Optional metadata for activation tracking
-
+        
         Returns:
             generated_ids: [batch, seq_len + max_output_tokens]
         """
         batch_size, input_len = input_ids.shape
-
-        # Initialize KV caches (None for prefill - model will initialize per-layer caches)
-        kv_caches = None
-
+        
+        # Initialize KV cache
+        kv_cache = None
+        if config.use_kv_cache:
+            cache_dtype = jnp.bfloat16 if config.kv_cache_dtype == 'bfloat16' else jnp.float32
+            kv_cache = KVCache.create_empty(
+                batch_size=batch_size,
+                n_layers=n_layers,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                max_seq_len=max_seq_len,
+                dtype=cache_dtype
+            )
+            
+            # Shard KV cache across mesh
+            cache_sharding = get_kv_cache_sharding(mesh, kv_cache.keys.shape)
+            kv_cache = KVCache(
+                keys=jax.device_put(kv_cache.keys, cache_sharding),
+                values=jax.device_put(kv_cache.values, cache_sharding),
+                cache_position=0
+            )
+        
         # Prefill phase: process input prompt
         if config.prefill_chunk_size and input_len > config.prefill_chunk_size:
             # Chunk prefill for very long sequences
             for chunk_start in range(0, input_len, config.prefill_chunk_size):
                 chunk_end = min(chunk_start + config.prefill_chunk_size, input_len)
                 chunk_ids = input_ids[:, chunk_start:chunk_end]
-                _, kv_caches = prefill_fn(params, chunk_ids, kv_caches)
+                _, kv_cache = prefill_fn(params, chunk_ids, kv_cache)
         else:
             # Single prefill pass
-            _, kv_caches = prefill_fn(params, input_ids, kv_caches)
-
+            _, kv_cache = prefill_fn(params, input_ids, kv_cache)
+        
         # Decode phase: generate tokens one by one
         generated_ids = input_ids
-
+        
         if config.use_scan_loop:
-            # NOTE: lax.scan currently doesn't work with growing KV caches
-            # because the cache shape changes on each iteration (growing from [batch, heads, seq_len, dim])
-            # This violates scan's requirement for constant carry shapes
-            # TODO: Implement with pre-allocated fixed-size caches for scan compatibility
-            print("Warning: scan_loop disabled - growing KV caches incompatible with lax.scan")
-            print("         Falling back to simple loop")
-
-            # Fall back to simple loop with activation extraction
-            for step in range(config.max_output_tokens):
-                last_token = generated_ids[:, -1:]
-                position = input_len + step
-
-                # Extract activations if configured
-                should_extract = (extract_activations and activation_extractor is not None
-                                and step % config.save_every_n_batches == 0)
-
-                next_token, kv_caches, activations = decode_step_fn(
-                    params, last_token, kv_caches, position, extract_acts=should_extract
-                )
-
-                # Store activations if extracted
-                if should_extract and activations and batch_metadata:
-                    for sample_idx in range(batch_size):
-                        if sample_idx < len(batch_metadata):
-                            meta = batch_metadata[sample_idx]
-                            for layer_name, layer_acts in activations.items():
-                                if layer_name.startswith('layer_'):
-                                    layer_idx = int(layer_name.split('_')[1])
-                                    # Extract this sample's activation
-                                    sample_act = layer_acts[sample_idx:sample_idx+1, -1, :]
-                                    activation_extractor.extract_layer_activation(
-                                        layer_idx, sample_act,
-                                        meta['task_id'], meta.get('idx', 0)
-                                    )
-
-                generated_ids = jnp.concatenate([generated_ids, next_token], axis=1)
+            # Use lax.scan for efficient loop
+            def scan_body(carry, _):
+                gen_ids, cache = carry
+                last_token = gen_ids[:, -1:]
+                next_token, new_cache = decode_step_fn(params, last_token, cache, rope_cache)
+                new_gen_ids = jnp.concatenate([gen_ids, next_token], axis=1)
+                return (new_gen_ids, new_cache), None
+            
+            (generated_ids, kv_cache), _ = lax.scan(
+                scan_body,
+                (generated_ids, kv_cache),
+                None,
+                length=config.max_output_tokens
+            )
         else:
-            # Simple loop with activation extraction
+            # Simple loop
             for step in range(config.max_output_tokens):
                 last_token = generated_ids[:, -1:]
-                position = input_len + step
-
-                # Extract activations if configured
-                should_extract = (extract_activations and activation_extractor is not None
-                                and step % config.save_every_n_batches == 0)
-
-                next_token, kv_caches, activations = decode_step_fn(
-                    params, last_token, kv_caches, position, extract_acts=should_extract
-                )
-
-                # Store activations if extracted
-                if should_extract and activations and batch_metadata:
-                    for sample_idx in range(batch_size):
-                        if sample_idx < len(batch_metadata):
-                            meta = batch_metadata[sample_idx]
-                            for layer_name, layer_acts in activations.items():
-                                if layer_name.startswith('layer_'):
-                                    layer_idx = int(layer_name.split('_')[1])
-                                    # Extract this sample's activation
-                                    sample_act = layer_acts[sample_idx:sample_idx+1, -1, :]
-                                    activation_extractor.extract_layer_activation(
-                                        layer_idx, sample_act,
-                                        meta['task_id'], meta.get('idx', 0)
-                                    )
-
+                next_token, kv_cache = decode_step_fn(params, last_token, kv_cache, rope_cache)
                 generated_ids = jnp.concatenate([generated_ids, next_token], axis=1)
-
+        
         return generated_ids
     
     return generate_with_cache
@@ -622,13 +693,8 @@ def inference_main_distributed():
         print(f"  KV Cache: {cfg.use_kv_cache}")
         print(f"  RoPE Cache: {cfg.use_rope_cache}")
         print(f"  Scan Loop: {cfg.use_scan_loop}")
-        print(f"  Extract Activations: {cfg.extract_activations}")
-
-        generate_fn = create_optimized_generate_fn(
-            model, cfg, mesh, qwen_config,
-            extract_activations=cfg.extract_activations,
-            activation_extractor=activation_extractor
-        )
+        
+        generate_fn = create_optimized_generate_fn(model, cfg, mesh, qwen_config)
         
         # Process in batches
         all_predictions = []
@@ -647,9 +713,9 @@ def inference_main_distributed():
             # Shard input
             data_sharding = get_data_sharding(mesh, batch_input_ids.shape)
             batch_input_ids = jax.device_put(batch_input_ids, data_sharding)
-
-            # Generate with optimizations (pass metadata for activation extraction)
-            generated_ids = generate_fn(sharded_params, batch_input_ids, batch_metadata)
+            
+            # Generate with optimizations
+            generated_ids = generate_fn(sharded_params, batch_input_ids)
             
             # Decode predictions
             for sample_idx in range(len(batch_metadata)):

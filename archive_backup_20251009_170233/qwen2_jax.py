@@ -20,16 +20,7 @@ import math
 from functools import partial
 import time
 
-# Import KV cache utilities
-from kvcache_utils import (
-    create_kv_cache_buffers,
-    update_kv_cache_ar,
-    write_prefill_cache,
-    get_attention_kv,
-    KVCacheConfig
-)
-
-@struct.dataclass
+@dataclass
 class QwenConfig:
     """Configuration for Qwen model."""
     vocab_size: int = 151936
@@ -44,8 +35,7 @@ class QwenConfig:
     tie_word_embeddings: bool = True
     use_sliding_window: bool = False
     sliding_window: int = 32768
-    use_fixed_cache: bool = False  # Use MaxText-style fixed-size cache
-    dtype: Any = struct.field(pytree_node=False, default=jnp.float32)
+    dtype: Any = jnp.float32
 
 
 def rotate_half(x):
@@ -170,10 +160,7 @@ class QwenAttention(nn.Module):
         v = v_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         # Apply rotary embeddings (use cached values)
-        # Use dynamic_slice instead of arange to avoid tracer issues
-        # Create position_ids by slicing the pre-computed position array
-        all_positions = jnp.arange(self.max_position_embeddings)
-        position_ids = lax.dynamic_slice(all_positions, (position_offset,), (seq_len,))
+        position_ids = jnp.arange(position_offset, position_offset + seq_len)
         q, k = apply_rotary_pos_emb(q, k, self.rope_cos, self.rope_sin, position_ids)
 
         # Handle KV cache
@@ -211,167 +198,6 @@ class QwenAttention(nn.Module):
         )(attn_output)
 
         return attn_output, new_kv_cache
-
-
-class QwenAttentionFixed(nn.Module):
-    """
-    Multi-headed attention with fixed-size KV cache (MaxText style)
-
-    Uses pre-allocated buffers and dynamic updates instead of concatenation.
-    JIT-friendly with static shapes throughout generation.
-    """
-    config: QwenConfig
-
-    def setup(self):
-        self.hidden_size = self.config.hidden_size
-        self.num_heads = self.config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = self.config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = self.config.max_position_embeddings
-        self.rope_theta = self.config.rope_theta
-
-        # Pre-compute and cache RoPE embeddings
-        dim = self.head_dim
-        max_seq_len = self.max_position_embeddings
-        inv_freq = 1.0 / (self.rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
-        t = jnp.arange(max_seq_len).astype(jnp.float32)
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.rope_cos = jnp.cos(emb)
-        self.rope_sin = jnp.sin(emb)
-
-    @nn.compact
-    def __call__(self, hidden_states, attention_mask=None, cache_dict=None, layer_idx=0,
-                 position_offset=0, is_prefill=False):
-        """
-        Forward pass with fixed-size KV cache
-
-        Args:
-            hidden_states: Input [batch, seq_len, hidden_dim]
-            attention_mask: Optional attention mask
-            cache_dict: Dictionary with fixed-size KV cache buffers
-            layer_idx: Which layer this is (for indexing into cache)
-            position_offset: Position offset for RoPE
-            is_prefill: Whether this is prefill phase
-
-        Returns:
-            attn_output: [batch, seq_len, hidden_dim]
-            cache_dict: Updated cache dictionary
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # Project Q, K, V
-        q_proj = nn.Dense(
-            self.num_heads * self.head_dim,
-            use_bias=True,
-            dtype=self.config.dtype,
-            name='q_proj'
-        )(hidden_states)
-        k_proj = nn.Dense(
-            self.num_key_value_heads * self.head_dim,
-            use_bias=True,
-            dtype=self.config.dtype,
-            name='k_proj'
-        )(hidden_states)
-        v_proj = nn.Dense(
-            self.num_key_value_heads * self.head_dim,
-            use_bias=True,
-            dtype=self.config.dtype,
-            name='v_proj'
-        )(hidden_states)
-
-        # Reshape for attention
-        q = q_proj.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-
-        # Transpose to [batch, num_heads, seq_len, head_dim] for attention
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
-
-        # Apply RoPE
-        all_positions = jnp.arange(self.max_position_embeddings)
-        position_ids = lax.dynamic_slice(all_positions, (position_offset,), (seq_len,))
-        q, k = apply_rotary_pos_emb(q, k, self.rope_cos, self.rope_sin, position_ids)
-
-        # Handle cache
-        if cache_dict is not None:
-            if is_prefill:
-                # Prefill: write entire K,V to prefill cache
-                # Transpose back: [batch, heads, seq, dim] -> [batch, seq, heads, dim]
-                k_for_cache = k.transpose(0, 2, 1, 3)
-                v_for_cache = v.transpose(0, 2, 1, 3)
-                cache_dict = write_prefill_cache(cache_dict, layer_idx, k_for_cache, v_for_cache)
-
-                # Get K,V for attention (just use current k,v for prefill)
-                k_full = k
-                v_full = v
-            else:
-                # Decode: update AR cache with single new token
-                # k,v shape: [batch, heads, 1, dim]
-                k_for_cache = k[:, :, 0, :]  # [batch, heads, dim]
-                v_for_cache = v[:, :, 0, :]  # [batch, heads, dim]
-                cache_dict = update_kv_cache_ar(cache_dict, layer_idx, k_for_cache, v_for_cache)
-
-                # Get full K,V from cache (returns full buffers, we'll mask appropriately)
-                k_cached, v_cached = get_attention_kv(cache_dict, layer_idx, use_prefill=True)
-                # Transpose: [batch, seq, heads, dim] -> [batch, heads, seq, dim]
-                k_full = k_cached.transpose(0, 2, 1, 3)
-                v_full = v_cached.transpose(0, 2, 1, 3)
-
-                # Create attention mask for cache
-                # Valid positions: [0:prefill_length) and [max_prefill:max_prefill+ar_index)
-                prefill_length = cache_dict['prefill']['length']
-                ar_index = cache_dict['ar']['index']
-                max_prefill = cache_dict['prefill']['k'].shape[2]  # max_prefill_length
-                total_cache_len = k_full.shape[2]  # max_prefill + max_decode
-
-                # Create mask: -inf for invalid positions, 0 for valid positions
-                # Shape: [1, 1, 1, total_cache_len] for broadcasting
-                pos_indices = jnp.arange(total_cache_len)
-                valid_prefill = pos_indices < prefill_length
-                valid_ar = (pos_indices >= max_prefill) & (pos_indices < max_prefill + ar_index)
-                cache_mask = jnp.where(valid_prefill | valid_ar, 0.0, -1e9)
-                cache_mask = cache_mask.reshape(1, 1, 1, total_cache_len)
-
-                # Combine with existing attention mask if present
-                if attention_mask is not None:
-                    attention_mask = attention_mask + cache_mask
-                else:
-                    attention_mask = cache_mask
-        else:
-            # No cache (shouldn't happen with fixed cache mode)
-            k_full = k
-            v_full = v
-
-        # Repeat k/v heads if using GQA
-        if self.num_key_value_groups > 1:
-            k_full = jnp.repeat(k_full, self.num_key_value_groups, axis=1)
-            v_full = jnp.repeat(v_full, self.num_key_value_groups, axis=1)
-
-        # Compute attention
-        attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = nn.softmax(attn_weights, axis=-1).astype(self.config.dtype)
-        attn_output = jnp.matmul(attn_weights, v_full)
-
-        # Reshape back
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.hidden_size)
-
-        # Output projection
-        attn_output = nn.Dense(
-            self.hidden_size,
-            use_bias=False,
-            dtype=self.config.dtype,
-            name='o_proj'
-        )(attn_output)
-
-        return attn_output, cache_dict
 
 
 class QwenDecoderLayer(nn.Module):
@@ -417,13 +243,12 @@ class QwenModel(nn.Module):
 
         # Create causal mask if not provided
         if attention_mask is None:
-            # For generation with KV cache: when we have cached states, create appropriate mask
-            if kv_caches is not None:
-                # With cache: we're decoding, no masking needed (attend to all previous tokens)
-                # We'll handle this in attention by not applying any mask
-                attention_mask = None  # Will be handled in attention layer
+            # For generation with KV cache, we only need to mask new tokens
+            if kv_caches is not None and position_offset > 0:
+                # Only mask for the current position against all previous positions
+                total_len = position_offset + seq_len
+                attention_mask = jnp.zeros((1, 1, seq_len, total_len))
             else:
-                # No cache: prefill phase, use causal mask
                 attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
                 attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
                 attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)

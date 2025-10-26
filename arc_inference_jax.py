@@ -17,6 +17,7 @@ from itertools import islice, product
 from transformers import AutoTokenizer
 from qwen2_jax import QwenConfig, convert_hf_to_jax_weights
 from qwen2_jax_fixed import QwenModelFixed, generate_with_kv_cache_timed
+from generate_parallel import generate_parallel
 from transformers import AutoModelForCausalLM
 import torch
 
@@ -45,6 +46,7 @@ class ARCConfig:
     batch_size: int = 8  # Smaller batch size for JAX
     random_seed: Optional[int] = None
     verbose: bool = False
+    use_data_parallel: bool = True  # Use data parallel across TPU devices
 
 
 def parse_args():
@@ -62,6 +64,8 @@ def parse_args():
     parser.add_argument('--max_output_tokens', type=int, help="Maximum number of tokens to generate")
     parser.add_argument('--random_seed', type=int, help="Random seed for data augmentation")
     parser.add_argument('--verbose', action='store_true', help="Print verbose output")
+    parser.add_argument('--use_data_parallel', action='store_true', default=True, help="Use data parallel across TPU devices")
+    parser.add_argument('--no_data_parallel', action='store_false', dest='use_data_parallel', help="Disable data parallel mode")
     return parser.parse_args()
 
 
@@ -130,47 +134,85 @@ def create_prompts(data: Dict, grid_encoder, tokenizer, prompt_version: str, pre
 
 
 def generate_outputs_with_batches(model, params, tokenizer, prompts: List[str],
-                                batch_size: int = 1, max_output_tokens: int = 1100):
+                                batch_size: int = 1, max_output_tokens: int = 1100,
+                                use_data_parallel: bool = False):
     """
     Generate outputs using JAX model with fixed KV cache
 
-    Uses optimized KV-cached generation from qwen2_jax_fixed.py.
-    Processing is sequential but uses JIT-compiled prefill/decode functions.
+    Supports both sequential and data parallel modes.
+
+    Args:
+        model: Model instance
+        params: Model parameters
+        tokenizer: Tokenizer
+        prompts: List of prompts
+        batch_size: Batch size (ignored in current implementation)
+        max_output_tokens: Maximum tokens to generate
+        use_data_parallel: If True, use pmap across devices
     """
-    outputs = []
-    print(f'Generating outputs for {len(prompts)} prompts (KV-cached, JIT prefill/decode)')
+    if use_data_parallel:
+        # Data parallel mode using pmap
+        num_devices = len(jax.devices())
+        print(f'Generating outputs for {len(prompts)} prompts (Data Parallel on {num_devices} devices)')
 
-    for prompt in tqdm(prompts, desc='Generating outputs'):
-        # Tokenize single prompt
-        inputs = tokenizer(prompt, return_tensors="np", truncation=True, max_length=2048)
-        input_ids = jnp.array(inputs['input_ids'])
-        input_len = input_ids.shape[1]
-
-        # Generate with KV cache (JIT-compiled prefill and decode functions)
-        generated_ids, _ = generate_with_kv_cache_timed(
-            model, params, input_ids,
+        # Use parallel generation
+        generated_texts = generate_parallel(
+            model, params, tokenizer, prompts,
             max_tokens=max_output_tokens,
             temperature=0.0,
-            tokenizer=tokenizer
+            verbose=True
         )
 
-        # Extract only the generated part
-        generated_part = generated_ids[0, input_len:]  # [0] to get first (only) batch item
+        # Create output objects
+        outputs = []
+        for text in generated_texts:
+            output = type('obj', (object,), {
+                'outputs': [type('obj', (object,), {
+                    'text': text,
+                    'cumulative_logprob': 0.0,
+                    'token_ids': []  # Not tracking tokens in parallel mode
+                })()]
+            })()
+            outputs.append(output)
 
-        # Convert to CPU and decode
-        generated_text = tokenizer.decode(np.array(generated_part), skip_special_tokens=True)
+        return outputs
 
-        # Mock output object to match original interface
-        output = type('obj', (object,), {
-            'outputs': [type('obj', (object,), {
-                'text': generated_text,
-                'cumulative_logprob': 0.0,  # Placeholder
-                'token_ids': np.array(generated_part).tolist()
-            })()]
-        })()
-        outputs.append(output)
+    else:
+        # Sequential mode (original implementation)
+        outputs = []
+        print(f'Generating outputs for {len(prompts)} prompts (Sequential, KV-cached)')
 
-    return outputs
+        for prompt in tqdm(prompts, desc='Generating outputs'):
+            # Tokenize single prompt
+            inputs = tokenizer(prompt, return_tensors="np", truncation=True, max_length=2048)
+            input_ids = jnp.array(inputs['input_ids'])
+            input_len = input_ids.shape[1]
+
+            # Generate with KV cache (JIT-compiled prefill and decode functions)
+            generated_ids, _ = generate_with_kv_cache_timed(
+                model, params, input_ids,
+                max_tokens=max_output_tokens,
+                temperature=0.0,
+                tokenizer=tokenizer
+            )
+
+            # Extract only the generated part
+            generated_part = generated_ids[0, input_len:]  # [0] to get first (only) batch item
+
+            # Convert to CPU and decode
+            generated_text = tokenizer.decode(np.array(generated_part), skip_special_tokens=True)
+
+            # Mock output object to match original interface
+            output = type('obj', (object,), {
+                'outputs': [type('obj', (object,), {
+                    'text': generated_text,
+                    'cumulative_logprob': 0.0,  # Placeholder
+                    'token_ids': np.array(generated_part).tolist()
+                })()]
+            })()
+            outputs.append(output)
+
+        return outputs
 
 
 def create_tasks_results(outputs, prompts_conf, grid_encoder, prompt_version: str, data: Dict, verbose: bool = False):
@@ -292,7 +334,9 @@ def inference_main():
     # Generate outputs with KV-cached generation
     outputs = generate_outputs_with_batches(
         model, params, tokenizer, prompts,
-        batch_size=cfg.batch_size, max_output_tokens=cfg.max_output_tokens)
+        batch_size=cfg.batch_size,
+        max_output_tokens=cfg.max_output_tokens,
+        use_data_parallel=cfg.use_data_parallel)
 
     # Process results
     task_results = create_tasks_results(

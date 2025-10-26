@@ -1,0 +1,43 @@
+WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Inference configuration: {'output_filepath': 'submission.json', 'model_path': 'KathirKs/qwen-2.5-0.5b', 'max_model_len': 10240, 'grid_encoder': 'GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))', 'prompt_version': 'output-from-examples-v0', 'dataset_path': 'test_data_small.json', 'n_tasks': 1, 'max_output_tokens': 50, 'predictions_per_task': 4, 'temperature': 0.0, 'batch_size': 8, 'random_seed': None, 'verbose': False, 'use_data_parallel': True}
+Initializing TPU...
+Found 4 TPU cores
+There are 1 tasks to solve in test_data_small.json
+Loading KathirKs/qwen-2.5-0.5b...
+Converting HuggingFace weights to JAX format...
+Creating prompts:   0%|          | 0/1 [00:00<?, ?it/s]Creating prompts: 100%|██████████| 1/1 [00:00<00:00, 66.25it/s]
+Generating outputs for 4 prompts (Data Parallel on 4 devices)
+Using 4 devices for parallel generation: ['TPU v4', 'TPU v4', 'TPU v4', 'TPU v4']
+Tokenizing 4 prompts...
+Batch shape after padding: (4, 1, 465)
+  Devices: 4
+  Batch per device: 1
+  Sequence length: 465
+Replicating parameters across devices...
+Generating 50 tokens per prompt in parallel...
+Traceback (most recent call last):
+  File "/home/kathirks_gc/.local/lib/python3.10/site-packages/jax/_src/core.py", line 936, in __getattr__
+    attr = getattr(self.aval, name)
+AttributeError: 'ShapedArray' object has no attribute 'block_until_ready'
+
+The above exception was the direct cause of the following exception:
+
+jax.errors.SimplifiedTraceback: For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/kathirks_gc/torch_xla/qwen/arc_inference_jax.py", line 359, in <module>
+    inference_main()
+  File "/home/kathirks_gc/torch_xla/qwen/arc_inference_jax.py", line 335, in inference_main
+    outputs = generate_outputs_with_batches(
+  File "/home/kathirks_gc/torch_xla/qwen/arc_inference_jax.py", line 159, in generate_outputs_with_batches
+    generated_texts = generate_parallel(
+  File "/home/kathirks_gc/torch_xla/qwen/generate_parallel.py", line 177, in generate_parallel
+    generated_ids = generate_one_device(
+  File "/home/kathirks_gc/torch_xla/qwen/generate_parallel.py", line 101, in generate_one_device
+    generated, _ = generate_with_kv_cache_timed(
+  File "/home/kathirks_gc/torch_xla/qwen/qwen2_jax_fixed.py", line 289, in generate_with_kv_cache_timed
+    generated_ids.block_until_ready()  # Wait for completion
+AttributeError: DynamicJaxprTracer has no attribute block_until_ready

@@ -11,7 +11,7 @@ This is 10-100x faster than generation-based extraction because:
 
 import jax
 import jax.numpy as jnp
-from jax import pmap
+from jax import pmap, jit
 import json
 import numpy as np
 from typing import Optional, Dict, Any, List
@@ -60,6 +60,14 @@ class ActivationExtractionConfig:
     output_dir: str = './activations_arc'
     save_every_n_batches: int = 10
 
+    # GCS upload config
+    upload_to_gcs: bool = False  # Enable GCS upload
+    gcs_bucket: Optional[str] = None  # GCS bucket name (e.g., 'my-bucket')
+    gcs_prefix: str = 'activations'  # Prefix/folder in bucket
+    shard_size_gb: float = 1.0  # Shard size in GB
+    compress_shards: bool = True  # Compress shards before upload
+    delete_local_after_upload: bool = False  # Delete local files after GCS upload
+
     # Other
     random_seed: Optional[int] = 42
     verbose: bool = True
@@ -69,77 +77,191 @@ class ActivationExtractionConfig:
         if self.layers_to_extract is None:
             self.layers_to_extract = list(range(10, 24))  # Layers 10-23 for Qwen2.5-0.5B
 
+        if self.upload_to_gcs and self.gcs_bucket is None:
+            raise ValueError("gcs_bucket must be specified when upload_to_gcs=True")
+
 
 class ActivationStorage:
-    """Handle saving activations to disk"""
+    """Handle saving activations to disk and optionally uploading to GCS with sharding"""
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, upload_to_gcs: bool = False,
+                 gcs_bucket: Optional[str] = None, gcs_prefix: str = 'activations',
+                 shard_size_gb: float = 1.0, compress_shards: bool = True,
+                 delete_local_after_upload: bool = False, verbose: bool = True):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.buffer = {}  # layer_idx -> list of activations
+        self.buffer_size_bytes = 0  # Track buffer size in bytes
+        self.shard_size_bytes = int(shard_size_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
+
         self.metadata = []
-        self.batch_count = 0
+        self.shard_count = 0
+        self.total_samples = 0
+        self.verbose = verbose
+
+        # GCS settings
+        self.upload_to_gcs = upload_to_gcs
+        self.gcs_bucket = gcs_bucket
+        self.gcs_prefix = gcs_prefix
+        self.compress_shards = compress_shards
+        self.delete_local_after_upload = delete_local_after_upload
+
+        # Initialize fsspec filesystem for GCS if needed
+        self.fs = None
+        if self.upload_to_gcs:
+            try:
+                import fsspec
+                self.fs = fsspec.filesystem('gs')  # GCS filesystem
+                if self.verbose:
+                    print(f"✓ fsspec GCS filesystem initialized for bucket: {gcs_bucket}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize fsspec GCS filesystem: {e}")
 
     def add_activation(self, layer_idx: int, activation: np.ndarray,
                       task_id: str, sample_idx: int, prompt: str):
-        """Add activation to buffer"""
+        """Add activation to buffer and check if shard size exceeded"""
         if layer_idx not in self.buffer:
             self.buffer[layer_idx] = []
 
-        self.buffer[layer_idx].append({
+        activation_data = {
             'task_id': task_id,
             'sample_idx': sample_idx,
             'activation': activation,
             'shape': activation.shape,
             'prompt': prompt[:200]  # Save first 200 chars of prompt for reference
-        })
+        }
 
-    def save_batch(self, force=False, save_every_n=10):
-        """Save buffered activations to disk"""
-        self.batch_count += 1
+        self.buffer[layer_idx].append(activation_data)
+        self.total_samples += 1
 
-        if not force and self.batch_count % save_every_n != 0:
-            return
+        # Estimate size (activation array + metadata overhead)
+        activation_size = activation.nbytes
+        metadata_overhead = 1024  # Rough estimate for metadata
+        self.buffer_size_bytes += activation_size + metadata_overhead
 
+        # Check if we should save a shard
+        if self.buffer_size_bytes >= self.shard_size_bytes:
+            self._save_shard()
+
+    def _save_shard(self):
+        """Save current buffer as a shard"""
         if not self.buffer:
             return
 
-        print(f"\nSaving activations (batch {self.batch_count})...")
+        self.shard_count += 1
+        shard_name = f"shard_{self.shard_count:04d}.pkl"
 
-        for layer_idx, activations in self.buffer.items():
-            filename = f"layer_{layer_idx:02d}_batch_{self.batch_count:04d}.pkl"
-            filepath = self.output_dir / filename
+        if self.compress_shards:
+            shard_name += ".gz"
 
-            with open(filepath, 'wb') as f:
-                pickle.dump(activations, f)
+        shard_path = self.output_dir / shard_name
 
-            print(f"  Saved {len(activations)} samples from layer {layer_idx} to {filename}")
+        if self.verbose:
+            size_mb = self.buffer_size_bytes / (1024 * 1024)
+            print(f"\n{'='*70}")
+            print(f"Saving shard {self.shard_count}: {shard_name} (~{size_mb:.1f} MB)")
+            print(f"{'='*70}")
 
-            self.metadata.append({
-                'batch_id': self.batch_count,
-                'layer_idx': layer_idx,
-                'filename': filename,
-                'n_samples': len(activations),
-                'avg_shape': activations[0]['shape'] if activations else None
-            })
+        # Save to local file
+        if self.compress_shards:
+            import gzip
+            with gzip.open(shard_path, 'wb') as f:
+                pickle.dump(self.buffer, f)
+        else:
+            with open(shard_path, 'wb') as f:
+                pickle.dump(self.buffer, f)
+
+        # Get actual file size
+        file_size_mb = shard_path.stat().st_size / (1024 * 1024)
+
+        if self.verbose:
+            print(f"  ✓ Saved locally: {file_size_mb:.1f} MB")
+            for layer_idx, activations in self.buffer.items():
+                print(f"    Layer {layer_idx}: {len(activations)} samples")
+
+        # Upload to GCS if enabled
+        gcs_path = None
+        if self.upload_to_gcs:
+            gcs_path = self._upload_to_gcs(shard_path, shard_name)
+
+        # Record metadata
+        self.metadata.append({
+            'shard_id': self.shard_count,
+            'filename': shard_name,
+            'local_path': str(shard_path),
+            'gcs_path': gcs_path,
+            'file_size_mb': file_size_mb,
+            'buffer_size_mb': self.buffer_size_bytes / (1024 * 1024),
+            'layers': list(self.buffer.keys()),
+            'samples_per_layer': {layer: len(acts) for layer, acts in self.buffer.items()},
+            'total_samples_in_shard': sum(len(acts) for acts in self.buffer.values())
+        })
+
+        # Delete local file if requested
+        if self.upload_to_gcs and self.delete_local_after_upload and gcs_path:
+            shard_path.unlink()
+            if self.verbose:
+                print(f"  ✓ Deleted local file (uploaded to GCS)")
 
         # Clear buffer
         self.buffer = {}
+        self.buffer_size_bytes = 0
+
+    def _upload_to_gcs(self, local_path: Path, shard_name: str) -> str:
+        """Upload shard to GCS using fsspec"""
+        try:
+            gcs_path = f"gs://{self.gcs_bucket}/{self.gcs_prefix}/{shard_name}"
+
+            if self.verbose:
+                print(f"  ⬆ Uploading to {gcs_path}...")
+
+            # Upload using fsspec
+            self.fs.put_file(str(local_path), gcs_path)
+
+            if self.verbose:
+                print(f"  ✓ Uploaded to GCS: {gcs_path}")
+
+            return gcs_path
+        except Exception as e:
+            print(f"  ✗ Failed to upload to GCS: {e}")
+            return None
+
+    def save_batch(self, force=False, save_every_n=10):
+        """Legacy method for compatibility - now triggers shard check"""
+        # This is now mainly used for periodic checks
+        # The actual saving is triggered by buffer size
+        pass
 
     def finalize(self):
         """Save remaining activations and metadata"""
-        self.save_batch(force=True)
+        # Save any remaining data
+        if self.buffer:
+            self._save_shard()
 
         # Save metadata
         metadata_file = self.output_dir / 'metadata.json'
         with open(metadata_file, 'w') as f:
             json.dump({
-                'total_batches': self.batch_count,
-                'batches': self.metadata
+                'total_shards': self.shard_count,
+                'total_samples': self.total_samples,
+                'shard_size_gb': self.shard_size_bytes / (1024 * 1024 * 1024),
+                'upload_to_gcs': self.upload_to_gcs,
+                'gcs_bucket': self.gcs_bucket,
+                'gcs_prefix': self.gcs_prefix,
+                'shards': self.metadata
             }, f, indent=2)
 
-        print(f"\nSaved metadata to {metadata_file}")
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print(f"STORAGE SUMMARY")
+            print(f"{'='*70}")
+            print(f"  Total shards: {self.shard_count}")
+            print(f"  Total samples: {self.total_samples}")
+            print(f"  Metadata: {metadata_file}")
+            if self.upload_to_gcs:
+                print(f"  GCS bucket: gs://{self.gcs_bucket}/{self.gcs_prefix}/")
+            print(f"{'='*70}")
 
 
 def create_prompts(data: Dict, grid_encoder, tokenizer, prompt_version: str,
@@ -186,7 +308,7 @@ def load_model_and_tokenizer(model_path: str, config: QwenConfig, layers_to_extr
     print(f"Loading HF model for weight conversion...")
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
         trust_remote_code=True
     )
 
@@ -215,9 +337,10 @@ def pad_sequences(sequences: List[np.ndarray], pad_token_id: int = 0) -> np.ndar
     return np.stack(padded)
 
 
+@partial(jit, static_argnums=(0,))
 def extract_activations_batch_single_device(model, params, input_ids):
     """
-    Extract activations for a single batch on one device
+    Extract activations for a single batch on one device (JIT compiled)
 
     Args:
         model: JAX model with hooks
@@ -235,6 +358,7 @@ def extract_activations_batch_single_device(model, params, input_ids):
     )
 
     return activations
+
 
 
 def replicate_params(params: Dict, num_devices: int) -> Dict:
@@ -261,7 +385,7 @@ def extract_activations_pmap(model, params, input_ids):
 
 def extract_activations_sequential(model, params, batches, prompts_data,
                                    storage: ActivationStorage, layers_to_extract: List[int],
-                                   verbose: bool = False):
+                                   batch_size: int, verbose: bool = False):
     """Extract activations sequentially (single device or CPU)"""
     for batch_idx, batch in enumerate(tqdm(batches, desc="Extracting activations", disable=not verbose)):
         input_ids = batch['input_ids']
@@ -271,7 +395,12 @@ def extract_activations_sequential(model, params, batches, prompts_data,
 
         # Process each sample in batch
         for sample_idx in range(input_ids.shape[0]):
-            prompt_data = prompts_data[batch_idx * input_ids.shape[0] + sample_idx]
+            # Calculate global sample index using fixed batch_size
+            global_sample_idx = batch_idx * batch_size + sample_idx
+            if global_sample_idx >= len(prompts_data):
+                break
+
+            prompt_data = prompts_data[global_sample_idx]
 
             # Extract activations for each layer
             for layer_idx in layers_to_extract:
@@ -288,7 +417,7 @@ def extract_activations_sequential(model, params, batches, prompts_data,
                         layer_idx=layer_idx,
                         activation=layer_act_np,
                         task_id=prompt_data['task_id'],
-                        sample_idx=prompt_data['idx'],
+                        sample_idx=global_sample_idx,
                         prompt=prompt_data['prompt']
                     )
 
@@ -337,10 +466,12 @@ def extract_activations_parallel(model, params, batches, prompts_data,
 
         # Process each sample
         for sample_idx in range(total_batch):
-            if batch_idx * total_batch + sample_idx >= len(prompts_data):
+            # Calculate global sample index using fixed batch_size
+            global_sample_idx = batch_idx * batch_size + sample_idx
+            if global_sample_idx >= len(prompts_data):
                 break
 
-            prompt_data = prompts_data[batch_idx * total_batch + sample_idx]
+            prompt_data = prompts_data[global_sample_idx]
 
             # Extract activations for each layer
             for layer_idx in layers_to_extract:
@@ -357,7 +488,7 @@ def extract_activations_parallel(model, params, batches, prompts_data,
                         layer_idx=layer_idx,
                         activation=layer_act_np,
                         task_id=prompt_data['task_id'],
-                        sample_idx=prompt_data['idx'],
+                        sample_idx=global_sample_idx,
                         prompt=prompt_data['prompt']
                     )
 
@@ -379,6 +510,15 @@ def main():
     parser.add_argument('--random_seed', type=int, help="Random seed")
     parser.add_argument('--verbose', action='store_true', help="Verbose output")
     parser.add_argument('--no_data_parallel', action='store_true', help="Disable data parallelism")
+
+    # GCS upload arguments
+    parser.add_argument('--upload_to_gcs', action='store_true', help="Upload shards to Google Cloud Storage")
+    parser.add_argument('--gcs_bucket', type=str, help="GCS bucket name (required if upload_to_gcs=True)")
+    parser.add_argument('--gcs_prefix', type=str, help="Prefix/folder in GCS bucket (default: activations)")
+    parser.add_argument('--shard_size_gb', type=float, help="Shard size in GB (default: 1.0)")
+    parser.add_argument('--compress_shards', action='store_true', default=None, help="Compress shards with gzip")
+    parser.add_argument('--no_compress_shards', action='store_false', dest='compress_shards', help="Don't compress shards")
+    parser.add_argument('--delete_local_after_upload', action='store_true', help="Delete local files after GCS upload")
 
     args = parser.parse_args()
 
@@ -473,7 +613,16 @@ def main():
     print(f"Created {len(batches)} batches")
 
     # Initialize storage
-    storage = ActivationStorage(cfg.output_dir)
+    storage = ActivationStorage(
+        output_dir=cfg.output_dir,
+        upload_to_gcs=cfg.upload_to_gcs,
+        gcs_bucket=cfg.gcs_bucket,
+        gcs_prefix=cfg.gcs_prefix,
+        shard_size_gb=cfg.shard_size_gb,
+        compress_shards=cfg.compress_shards,
+        delete_local_after_upload=cfg.delete_local_after_upload,
+        verbose=cfg.verbose
+    )
 
     # Extract activations
     print(f"\nExtracting activations from layers {cfg.layers_to_extract}...")
@@ -490,6 +639,7 @@ def main():
         extract_activations_sequential(
             model, params, batches, prompts_data,
             storage, cfg.layers_to_extract,
+            cfg.batch_size,
             verbose=cfg.verbose
         )
 

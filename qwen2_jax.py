@@ -539,8 +539,9 @@ def main():
         print(f"Available devices: {jax.devices()}")
     
     # Load model and tokenizer from HuggingFace
-    print("\nLoading Qwen2.5-0.5B model from HuggingFace...")
-    model_name = "KathirKs/qwen-2.5-0.5b"
+    print("\nLoading Qwen2.5-7B model from HuggingFace...")
+    # model_name = "KathirKs/qwen-2.5-0.5b"
+    model_name = "Qwen/Qwen2.5-7B"
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -610,7 +611,7 @@ def main():
         return jax_model.apply(params, input_id, kv_caches=kv_caches, position_offset=position)
 
     # Generate tokens with KV caching
-    max_new_tokens = 50
+    max_new_tokens = 20
 
     print("\nGenerating text (with KV cache optimization)...")
     start_time = time.time()

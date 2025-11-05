@@ -399,6 +399,7 @@ python extract_activations_arc.py \
   --gcs_prefix train_activations \
   ...
 
+
 # Terminal 2
 python extract_activations_arc.py \
   --dataset_path val_set.json \

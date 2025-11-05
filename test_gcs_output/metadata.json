@@ -1,0 +1,105 @@
+{
+  "total_shards": 5,
+  "total_samples": 15,
+  "shard_size_gb": 0.0009999992325901985,
+  "upload_to_gcs": true,
+  "gcs_bucket": "fineweb-edu-us-central1",
+  "gcs_prefix": "test_activations",
+  "shards": [
+    {
+      "shard_id": 1,
+      "filename": "shard_0001.pkl.gz",
+      "local_path": "test_gcs_output/shard_0001.pkl.gz",
+      "gcs_path": "gs://fineweb-edu-us-central1/test_activations/shard_0001.pkl.gz",
+      "file_size_mb": 0.9501686096191406,
+      "buffer_size_mb": 1.0283203125,
+      "layers": [
+        10,
+        11,
+        12
+      ],
+      "samples_per_layer": {
+        "10": 1,
+        "11": 1,
+        "12": 1
+      },
+      "total_samples_in_shard": 3
+    },
+    {
+      "shard_id": 2,
+      "filename": "shard_0002.pkl.gz",
+      "local_path": "test_gcs_output/shard_0002.pkl.gz",
+      "gcs_path": "gs://fineweb-edu-us-central1/test_activations/shard_0002.pkl.gz",
+      "file_size_mb": 0.9503326416015625,
+      "buffer_size_mb": 1.0283203125,
+      "layers": [
+        10,
+        11,
+        12
+      ],
+      "samples_per_layer": {
+        "10": 1,
+        "11": 1,
+        "12": 1
+      },
+      "total_samples_in_shard": 3
+    },
+    {
+      "shard_id": 3,
+      "filename": "shard_0003.pkl.gz",
+      "local_path": "test_gcs_output/shard_0003.pkl.gz",
+      "gcs_path": "gs://fineweb-edu-us-central1/test_activations/shard_0003.pkl.gz",
+      "file_size_mb": 0.9501485824584961,
+      "buffer_size_mb": 1.0283203125,
+      "layers": [
+        10,
+        11,
+        12
+      ],
+      "samples_per_layer": {
+        "10": 1,
+        "11": 1,
+        "12": 1
+      },
+      "total_samples_in_shard": 3
+    },
+    {
+      "shard_id": 4,
+      "filename": "shard_0004.pkl.gz",
+      "local_path": "test_gcs_output/shard_0004.pkl.gz",
+      "gcs_path": "gs://fineweb-edu-us-central1/test_activations/shard_0004.pkl.gz",
+      "file_size_mb": 0.9502735137939453,
+      "buffer_size_mb": 1.0283203125,
+      "layers": [
+        10,
+        11,
+        12
+      ],
+      "samples_per_layer": {
+        "10": 1,
+        "11": 1,
+        "12": 1
+      },
+      "total_samples_in_shard": 3
+    },
+    {
+      "shard_id": 5,
+      "filename": "shard_0005.pkl.gz",
+      "local_path": "test_gcs_output/shard_0005.pkl.gz",
+      "gcs_path": "gs://fineweb-edu-us-central1/test_activations/shard_0005.pkl.gz",
+      "file_size_mb": 0.9501438140869141,
+      "buffer_size_mb": 1.0283203125,
+      "layers": [
+        10,
+        11,
+        12
+      ],
+      "samples_per_layer": {
+        "10": 1,
+        "11": 1,
+        "12": 1
+      },
+      "total_samples_in_shard": 3
+    }
+  ]
+}

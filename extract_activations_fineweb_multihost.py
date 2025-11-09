@@ -1,16 +1,30 @@
 """
 Distributed Activation Extraction for FineWeb-Edu Dataset
+WITH MULTI-HOST TPU SUPPORT (v5e-64, v6e, etc.)
 
-Designed to run on 32 individual TPU machines with data distribution.
-Each machine processes its own shard of the dataset independently.
+Supports:
+1. Single-host TPUs (v4-8, v4-32, v5litepod-8, etc.) - TESTED ✅
+2. Multi-host TPUs (v5e-64, v6e-256, etc.) - NEW
 
-Usage on each machine:
-    python extract_activations_fineweb.py \
+Multi-host usage (e.g., v5e-64 with 4 hosts):
+    # On each host (0-3):
+    python extract_activations_fineweb_multihost.py \
         --machine_id 0 \
         --total_machines 32 \
+        --multihost \
+        --coordinator_address "10.0.0.1:8476" \
+        --host_id 0 \
+        --num_hosts 4 \
+        --mesh_type 2d \
         --batch_size 8 \
         --upload_to_gcs \
         --gcs_bucket your-bucket-name
+
+Single-host usage (backward compatible):
+    python extract_activations_fineweb_multihost.py \
+        --machine_id 0 \
+        --total_machines 1 \
+        --batch_size 8
 """
 
 import jax
@@ -94,9 +108,21 @@ class ActivationExtractionConfig:
         if self.machine_id >= self.total_machines:
             raise ValueError(f"machine_id ({self.machine_id}) must be < total_machines ({self.total_machines})")
 
+        # Multi-host validation
+        if self.multihost:
+            if self.coordinator_address is None:
+                raise ValueError("coordinator_address must be specified when multihost=True")
+            if self.host_id >= self.num_hosts:
+                raise ValueError(f"host_id ({self.host_id}) must be < num_hosts ({self.num_hosts})")
+            if self.mesh_type not in ['1d', '2d', '3d']:
+                raise ValueError(f"mesh_type must be '1d', '2d', or '3d', got: {self.mesh_type}")
+
         # Create machine-specific GCS prefix to avoid conflicts (only if using GCS)
         if self.upload_to_gcs:
-            self.gcs_prefix = f"{self.gcs_prefix}/machine_{self.machine_id:03d}"
+            prefix = f"{self.gcs_prefix}/machine_{self.machine_id:03d}"
+            if self.multihost:
+                prefix += f"_host_{self.host_id:02d}"
+            self.gcs_prefix = prefix
 
 
 class ActivationStorage:
@@ -343,22 +369,105 @@ def pad_sequences(sequences: List[np.ndarray], pad_token_id: int = 0) -> np.ndar
     return np.stack(padded)
 
 
-def create_device_mesh(num_devices: int) -> Tuple[Mesh, NamedSharding]:
+def initialize_multihost(coordinator_address: str, num_hosts: int, host_id: int, verbose: bool = True):
     """
-    Create a device mesh for model sharding
+    Initialize JAX distributed for multi-host TPU
 
     Args:
-        num_devices: Number of TPU/GPU cores
+        coordinator_address: "IP:PORT" of coordinator (usually host 0)
+        num_hosts: Total number of hosts in the pod
+        host_id: This host's ID (0 to num_hosts-1)
+        verbose: Print initialization info
+
+    Returns:
+        num_devices: Total number of devices across ALL hosts
+    """
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"INITIALIZING MULTI-HOST JAX DISTRIBUTED")
+        print(f"{'='*70}")
+        print(f"  Coordinator: {coordinator_address}")
+        print(f"  Total hosts: {num_hosts}")
+        print(f"  This host ID: {host_id}")
+
+    # Initialize JAX distributed
+    jax.distributed.initialize(
+        coordinator_address=coordinator_address,
+        num_processes=num_hosts,
+        process_id=host_id
+    )
+
+    # Get all devices (across all hosts)
+    devices = jax.devices()
+    num_devices = len(devices)
+    local_devices = jax.local_devices()
+
+    if verbose:
+        print(f"  ✓ JAX distributed initialized")
+        print(f"  Global devices: {num_devices} ({[d.device_kind for d in devices[:4]]}...)")
+        print(f"  Local devices on host {host_id}: {len(local_devices)}")
+        print(f"  Process index: {jax.process_index()}")
+        print(f"  Process count: {jax.process_count()}")
+        print(f"{'='*70}\n")
+
+    return num_devices
+
+
+def create_device_mesh(num_devices: int, mesh_type: str = '1d', num_hosts: int = 1) -> Tuple[Mesh, NamedSharding]:
+    """
+    Create a device mesh for model sharding (single or multi-host)
+
+    Args:
+        num_devices: Total number of TPU/GPU cores (across all hosts)
+        mesh_type: '1d' (model only), '2d' (data+model), or '3d' (pipeline+data+model)
+        num_hosts: Number of hosts (for multi-host)
 
     Returns:
         mesh: JAX Mesh object
         replicated_sharding: Sharding for fully replicated arrays
     """
-    # Create 1D mesh for model parallelism
-    devices = mesh_utils.create_device_mesh((num_devices,))
-    mesh = Mesh(devices, axis_names=('model',))
+    if mesh_type == '1d':
+        # 1D mesh: pure model parallelism
+        devices = mesh_utils.create_device_mesh((num_devices,))
+        mesh = Mesh(devices, axis_names=('model',))
 
-    # Create sharding for replicated arrays (used for activations and inputs)
+    elif mesh_type == '2d':
+        # 2D mesh: data + model parallelism
+        # Strategy: data axis = num_hosts, model axis = devices_per_host
+        if num_hosts > 1:
+            devices_per_host = num_devices // num_hosts
+            devices = mesh_utils.create_device_mesh((num_hosts, devices_per_host))
+            mesh = Mesh(devices, axis_names=('data', 'model'))
+        else:
+            # Single host: split devices into data and model
+            # Use reasonable split (e.g., 2 data replicas if >= 8 devices)
+            if num_devices >= 8:
+                data_axis = 2
+                model_axis = num_devices // 2
+            else:
+                data_axis = 1
+                model_axis = num_devices
+            devices = mesh_utils.create_device_mesh((data_axis, model_axis))
+            mesh = Mesh(devices, axis_names=('data', 'model'))
+
+    elif mesh_type == '3d':
+        # 3D mesh: pipeline + data + model
+        # For very large models (e.g., 70B+)
+        # Example: 4 pipeline × 4 data × (devices/16) model
+        if num_devices >= 64:
+            pipeline_axis = 4
+            data_axis = 4
+            model_axis = num_devices // (pipeline_axis * data_axis)
+            devices = mesh_utils.create_device_mesh((pipeline_axis, data_axis, model_axis))
+            mesh = Mesh(devices, axis_names=('pipeline', 'data', 'model'))
+        else:
+            # Fall back to 2D for smaller pods
+            return create_device_mesh(num_devices, '2d', num_hosts)
+
+    else:
+        raise ValueError(f"Invalid mesh_type: {mesh_type}. Must be '1d', '2d', or '3d'")
+
+    # Create sharding for replicated arrays
     replicated_sharding = NamedSharding(mesh, P())
 
     return mesh, replicated_sharding
@@ -369,11 +478,16 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, PartitionSpec]:
     Define sharding strategy for model parameters
 
     For Qwen model:
-    - Embed tokens: shard along vocab dimension
+    - Embed tokens: shard along vocab dimension (model axis)
     - Attention weights (q, k, v, o): shard along hidden/head dimension
     - MLP weights: shard along intermediate dimension
     - Layer norms: replicated (small)
     - Output head: shard along vocab dimension
+
+    For 2D meshes ('data', 'model'):
+    - Parameters are replicated along 'data' axis
+    - Parameters are sharded along 'model' axis
+    - Activations/inputs are sharded along 'data' axis
 
     Args:
         mesh: JAX Mesh object
@@ -381,31 +495,60 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, PartitionSpec]:
     Returns:
         Dictionary mapping parameter paths to PartitionSpec
     """
-    # Default sharding rules
-    # We'll shard large weight matrices along their first dimension (model parallel)
-    return {
-        # Embedding layer - shard along vocab dimension
-        'embed_tokens': P('model', None),
+    # Check mesh dimensionality
+    mesh_axes = mesh.axis_names
 
-        # Attention layers - shard along hidden dimension
-        'q_proj': P(None, 'model'),  # [hidden, hidden]
-        'k_proj': P(None, 'model'),  # [hidden, kv_hidden]
-        'v_proj': P(None, 'model'),  # [hidden, kv_hidden]
-        'o_proj': P('model', None),  # [hidden, hidden]
+    if mesh_axes == ('model',):
+        # 1D mesh: pure model parallelism
+        return {
+            'embed_tokens': P('model', None),
+            'q_proj': P(None, 'model'),
+            'k_proj': P(None, 'model'),
+            'v_proj': P(None, 'model'),
+            'o_proj': P('model', None),
+            'gate_proj': P(None, 'model'),
+            'up_proj': P(None, 'model'),
+            'down_proj': P('model', None),
+            'input_layernorm': P(),
+            'post_attention_layernorm': P(),
+            'norm': P(),
+            'lm_head': P(None, 'model'),
+        }
 
-        # MLP layers - shard along intermediate dimension
-        'gate_proj': P(None, 'model'),  # [hidden, intermediate]
-        'up_proj': P(None, 'model'),    # [hidden, intermediate]
-        'down_proj': P('model', None),  # [intermediate, hidden]
+    elif mesh_axes == ('data', 'model'):
+        # 2D mesh: data + model parallelism
+        # Parameters: replicated on 'data', sharded on 'model'
+        return {
+            'embed_tokens': P(None, 'model', None),  # [vocab, hidden] -> replicate data, shard vocab
+            'q_proj': P(None, None, 'model'),        # [hidden, hidden]
+            'k_proj': P(None, None, 'model'),        # [hidden, kv_hidden]
+            'v_proj': P(None, None, 'model'),        # [hidden, kv_hidden]
+            'o_proj': P(None, 'model', None),        # [hidden, hidden]
+            'gate_proj': P(None, None, 'model'),     # [hidden, intermediate]
+            'up_proj': P(None, None, 'model'),       # [hidden, intermediate]
+            'down_proj': P(None, 'model', None),     # [intermediate, hidden]
+            'input_layernorm': P(),
+            'post_attention_layernorm': P(),
+            'norm': P(),
+            'lm_head': P(None, None, 'model'),       # [hidden, vocab]
+        }
 
-        # Norms - replicate (small)
-        'input_layernorm': P(),
-        'post_attention_layernorm': P(),
-        'norm': P(),
-
-        # Output head - shard along vocab dimension
-        'lm_head': P(None, 'model'),
-    }
+    else:
+        # 3D or other: fall back to model-only sharding
+        return {
+            'embed_tokens': P(None, 'model'),
+            'q_proj': P(None, 'model'),
+            'k_proj': P(None, 'model'),
+            'v_proj': P(None, 'model'),
+            'o_proj': P('model', None),
+            'gate_proj': P(None, 'model'),
+            'up_proj': P(None, 'model'),
+            'down_proj': P('model', None),
+            'input_layernorm': P(),
+            'post_attention_layernorm': P(),
+            'norm': P(),
+            'lm_head': P(None, 'model'),
+        }
 
 
 def shard_params(params: Dict, mesh: Mesh, sharding_rules: Dict[str, PartitionSpec]) -> Dict:
@@ -712,6 +855,13 @@ def main():
     parser.add_argument('--compress_shards', action='store_true', default=None, help="Compress shards with gzip")
     parser.add_argument('--no_compress_shards', action='store_false', dest='compress_shards', help="Don't compress")
     parser.add_argument('--delete_local_after_upload', action='store_true', help="Delete local files after GCS upload")
+
+    # Multi-host TPU args
+    parser.add_argument('--multihost', action='store_true', help="Enable multi-host TPU support")
+    parser.add_argument('--coordinator_address', type=str, help="Coordinator address (IP:PORT) for multi-host")
+    parser.add_argument('--host_id', type=int, help="Host ID within the pod (0 to num_hosts-1)")
+    parser.add_argument('--num_hosts', type=int, help="Total number of hosts in the pod")
+    parser.add_argument('--mesh_type', type=str, help="Mesh type: 1d, 2d, or 3d")
 
     # Other args
     parser.add_argument('--verbose', action='store_true', help="Verbose output")

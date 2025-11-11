@@ -356,14 +356,26 @@ def load_model_and_tokenizer(model_path: str, config: QwenConfig, layers_to_extr
     return jax_model, tokenizer, params
 
 
-def pad_sequences(sequences: List[np.ndarray], pad_token_id: int = 0) -> np.ndarray:
-    """Pad sequences to same length"""
-    max_len = max(len(seq) for seq in sequences)
+def pad_sequences(sequences: List[np.ndarray], pad_token_id: int = 0, fixed_length: Optional[int] = None) -> np.ndarray:
+    """Pad sequences to same length
+
+    Args:
+        sequences: List of sequences to pad
+        pad_token_id: Token ID to use for padding
+        fixed_length: If provided, pad to this exact length. Otherwise pad to max in batch.
+    """
+    if fixed_length is not None:
+        max_len = fixed_length
+    else:
+        max_len = max(len(seq) for seq in sequences)
 
     padded = []
     for seq in sequences:
         if len(seq) < max_len:
             seq = np.pad(seq, (0, max_len - len(seq)), constant_values=pad_token_id)
+        elif len(seq) > max_len:
+            # Truncate if longer than fixed_length
+            seq = seq[:max_len]
         padded.append(seq)
 
     return np.stack(padded)
@@ -517,20 +529,22 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, PartitionSpec]:
 
     elif mesh_axes == ('data', 'model'):
         # 2D mesh: data + model parallelism
-        # Parameters: replicated on 'data', sharded on 'model'
+        # Parameters: replicated across 'data' axis, sharded on 'model' axis
+        # NOTE: Partition specs map to array dimensions, NOT mesh dimensions
+        # So 2D arrays get 2D specs: P(None, 'model') means shard along 2nd dim on 'model' axis
         return {
-            'embed_tokens': P(None, 'model', None),  # [vocab, hidden] -> replicate data, shard vocab
-            'q_proj': P(None, None, 'model'),        # [hidden, hidden]
-            'k_proj': P(None, None, 'model'),        # [hidden, kv_hidden]
-            'v_proj': P(None, None, 'model'),        # [hidden, kv_hidden]
-            'o_proj': P(None, 'model', None),        # [hidden, hidden]
-            'gate_proj': P(None, None, 'model'),     # [hidden, intermediate]
-            'up_proj': P(None, None, 'model'),       # [hidden, intermediate]
-            'down_proj': P(None, 'model', None),     # [intermediate, hidden]
+            'embed_tokens': P('model', None),  # [vocab, hidden] -> shard vocab on model axis
+            'q_proj': P(None, 'model'),        # [hidden, hidden]
+            'k_proj': P(None, 'model'),        # [hidden, kv_hidden]
+            'v_proj': P(None, 'model'),        # [hidden, kv_hidden]
+            'o_proj': P('model', None),        # [hidden, hidden]
+            'gate_proj': P(None, 'model'),     # [hidden, intermediate]
+            'up_proj': P(None, 'model'),       # [hidden, intermediate]
+            'down_proj': P('model', None),     # [intermediate, hidden]
             'input_layernorm': P(),
             'post_attention_layernorm': P(),
             'norm': P(),
-            'lm_head': P(None, None, 'model'),       # [hidden, vocab]
+            'lm_head': P(None, 'model'),       # [hidden, vocab]
         }
 
     else:
@@ -686,7 +700,8 @@ def extract_activations_sequential(model, params, dataset, tokenizer,
                 process_batch(
                     model, params, batch_sequences, batch_sample_indices,
                     batch_text_previews, storage, layers_to_extract,
-                    tokenizer.pad_token_id or 0
+                    tokenizer.pad_token_id or 0, batch_size=batch_size,
+                    max_seq_length=max_seq_length
                 )
 
                 batch_sequences = []
@@ -694,28 +709,43 @@ def extract_activations_sequential(model, params, dataset, tokenizer,
                 batch_text_previews = []
 
     finally:
-        # Process remaining samples
+        # Process remaining samples (PAD to batch_size to avoid recompilation!)
         if batch_sequences:
             process_batch(
                 model, params, batch_sequences, batch_sample_indices,
                 batch_text_previews, storage, layers_to_extract,
-                tokenizer.pad_token_id or 0
+                tokenizer.pad_token_id or 0, batch_size=batch_size,
+                max_seq_length=max_seq_length
             )
 
         pbar.close()
 
 
 def process_batch(model, params, sequences, sample_indices, text_previews,
-                  storage, layers_to_extract, pad_token_id, use_sharding=False):
-    """Process a single batch of sequences"""
-    # Pad sequences
-    padded = pad_sequences(sequences, pad_token_id=pad_token_id)
+                  storage, layers_to_extract, pad_token_id, use_sharding=False,
+                  batch_size=None, max_seq_length=None):
+    """Process a single batch of sequences
+
+    IMPORTANT: Pads batch dimension to batch_size AND sequence length to max_seq_length
+    to avoid JIT recompilation!
+    """
+    # PAD BATCH DIMENSION to avoid JIT recompilation!
+    # If batch_size provided and current batch is smaller, pad to batch_size
+    actual_batch_size = len(sequences)
+    if batch_size is not None and actual_batch_size < batch_size:
+        # Pad with duplicate of last sequence (will be ignored)
+        pad_count = batch_size - actual_batch_size
+        sequences = sequences + [sequences[-1]] * pad_count
+
+    # Pad sequences (length dimension) to FIXED length
+    padded = pad_sequences(sequences, pad_token_id=pad_token_id, fixed_length=max_seq_length)
+
     input_ids = jnp.array(padded)
 
     # Forward pass (automatically handles sharding if params are sharded)
     activations = extract_activations_sharded(model, params, input_ids)
 
-    # Process each sample in batch
+    # Process ONLY actual samples (not padding)
     for i, (sample_idx, text_preview) in enumerate(zip(sample_indices, text_previews)):
         # Extract activations for each layer
         for layer_idx in layers_to_extract:
@@ -802,7 +832,8 @@ def extract_activations_with_sharding(model, params, dataset, tokenizer,
                 process_batch(
                     model, params, batch_sequences, batch_sample_indices,
                     batch_text_previews, storage, layers_to_extract,
-                    tokenizer.pad_token_id or 0
+                    tokenizer.pad_token_id or 0, batch_size=batch_size,
+                    max_seq_length=max_seq_length
                 )
 
                 batch_sequences = []
@@ -810,12 +841,13 @@ def extract_activations_with_sharding(model, params, dataset, tokenizer,
                 batch_text_previews = []
 
     finally:
-        # Process remaining samples
+        # Process remaining samples (PAD to batch_size to avoid recompilation!)
         if batch_sequences:
             process_batch(
                 model, params, batch_sequences, batch_sample_indices,
                 batch_text_previews, storage, layers_to_extract,
-                tokenizer.pad_token_id or 0
+                tokenizer.pad_token_id or 0, batch_size=batch_size,
+                max_seq_length=max_seq_length
             )
 
         pbar.close()
@@ -878,14 +910,25 @@ def main():
 
     print("="*70)
     print(f"FINEWEB-EDU ACTIVATION EXTRACTION - MACHINE {cfg.machine_id}/{cfg.total_machines-1}")
+    if cfg.multihost:
+        print(f"MULTI-HOST MODE - Host {cfg.host_id}/{cfg.num_hosts-1}")
     print("="*70)
     print(json.dumps(asdict(cfg), indent=2))
     print("="*70)
 
-    # Check available devices on this machine
-    devices = jax.devices()
-    num_devices = len(devices)
-    print(f"\nMachine {cfg.machine_id} - Found {num_devices} device(s): {[d.device_kind for d in devices]}")
+    # Initialize multi-host if needed (MUST be done before jax.devices())
+    if cfg.multihost:
+        num_devices = initialize_multihost(
+            cfg.coordinator_address,
+            cfg.num_hosts,
+            cfg.host_id,
+            cfg.verbose
+        )
+    else:
+        # Single host - just get local devices
+        devices = jax.devices()
+        num_devices = len(devices)
+        print(f"\nMachine {cfg.machine_id} - Found {num_devices} device(s): {[d.device_kind for d in devices]}")
 
     # Load dataset shard
     dataset = load_dataset_shard(
@@ -951,8 +994,17 @@ def main():
     mesh = None
     if cfg.use_data_parallel and num_devices > 1:
         print(f"\nSetting up model sharding across {num_devices} devices...")
-        mesh, replicated_sharding = create_device_mesh(num_devices)
+        if cfg.multihost:
+            print(f"  Multi-host mode: {cfg.num_hosts} hosts × {num_devices // cfg.num_hosts} devices/host")
+            print(f"  Mesh type: {cfg.mesh_type}")
+
+        mesh, replicated_sharding = create_device_mesh(
+            num_devices,
+            mesh_type=cfg.mesh_type,
+            num_hosts=cfg.num_hosts
+        )
         print(f"  ✓ Created mesh with axis: {mesh.axis_names}")
+        print(f"  ✓ Mesh shape: {mesh.devices.shape}")
 
         # Create sharding strategy
         sharding_rules = create_sharding_strategy(mesh)
@@ -965,9 +1017,15 @@ def main():
         print(f"  ✓ Parameters sharded successfully")
 
         # Print memory info
-        print(f"\n  Memory distribution across devices:")
-        for i, device in enumerate(jax.devices()):
-            print(f"    Device {i} ({device.device_kind}): Ready")
+        if cfg.multihost:
+            print(f"\n  Memory distribution (global view across all hosts):")
+            local_device_count = len(jax.local_devices())
+            print(f"    Host {cfg.host_id}: {local_device_count} local devices")
+            print(f"    Total: {num_devices} devices across {cfg.num_hosts} hosts")
+        else:
+            print(f"\n  Memory distribution across devices:")
+            for i, device in enumerate(jax.devices()):
+                print(f"    Device {i} ({device.device_kind}): Ready")
 
     # Initialize storage
     storage = ActivationStorage(
@@ -983,7 +1041,13 @@ def main():
 
     # Extract activations
     print(f"\nExtracting activations from layers {cfg.layers_to_extract}...")
-    print(f"Mode: {'Model Sharding' if cfg.use_data_parallel and num_devices > 1 else 'Sequential'}")
+    if cfg.use_data_parallel and num_devices > 1 and mesh is not None:
+        mode_str = f"Sharding ({cfg.mesh_type.upper()} mesh: {mesh.axis_names})"
+        if cfg.multihost:
+            mode_str += f" - Multi-host ({cfg.num_hosts} hosts)"
+        print(f"Mode: {mode_str}")
+    else:
+        print(f"Mode: Sequential")
 
     if cfg.use_data_parallel and num_devices > 1 and mesh is not None:
         with mesh:

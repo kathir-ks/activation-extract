@@ -1,0 +1,28 @@
+/usr/lib/python3/dist-packages/pytz/__init__.py:31: SyntaxWarning: invalid escape sequence '\s'
+  match = re.match("^#\s*version\s*([0-9a-z]*)\s*$", line)
+usage: extract_activations_fineweb_multihost.py [-h] --machine_id MACHINE_ID
+                                                [--total_machines TOTAL_MACHINES]
+                                                [--model_path MODEL_PATH]
+                                                [--dataset_name DATASET_NAME]
+                                                [--dataset_config DATASET_CONFIG]
+                                                [--dataset_split DATASET_SPLIT]
+                                                [--max_samples MAX_SAMPLES]
+                                                [--batch_size BATCH_SIZE]
+                                                [--layers_to_extract LAYERS_TO_EXTRACT [LAYERS_TO_EXTRACT ...]]
+                                                [--max_seq_length MAX_SEQ_LENGTH]
+                                                [--output_dir OUTPUT_DIR]
+                                                [--upload_to_gcs]
+                                                [--gcs_bucket GCS_BUCKET]
+                                                [--gcs_prefix GCS_PREFIX]
+                                                [--shard_size_gb SHARD_SIZE_GB]
+                                                [--compress_shards]
+                                                [--no_compress_shards]
+                                                [--delete_local_after_upload]
+                                                [--multihost]
+                                                [--coordinator_address COORDINATOR_ADDRESS]
+                                                [--host_id HOST_ID]
+                                                [--num_hosts NUM_HOSTS]
+                                                [--mesh_type MESH_TYPE]
+                                                [--verbose]
+                                                [--no_data_parallel]
+extract_activations_fineweb_multihost.py: error: argument --layers_to_extract: invalid int value: ''

@@ -1,0 +1,38 @@
+# Docker Compose file for local testing (not for TPU v5e-64)
+# Use this for testing the Docker image locally before deploying to TPU
+
+version: '3.8'
+
+services:
+  activation-extraction:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: activation-extraction:latest
+    volumes:
+      - ./:/workspace/data
+      - ~/.config/gcloud:/root/.config/gcloud:ro  # Mount GCP credentials
+    environment:
+      # Model config
+      - MODEL_PATH=KathirKs/qwen-2.5-0.5b  # Use smaller model for testing
+
+      # Dataset config
+      - DATASET_PATH=/workspace/data/arc_formatted_challenges.jsonl
+      - MAX_TASKS=10  # Small number for testing
+
+      # Extraction config
+      - BATCH_SIZE=2
+      - MAX_SEQ_LENGTH=512
+
+      # GCS config
+      - GCS_BUCKET=${GCS_BUCKET}
+      - GCS_PREFIX=test_activations
+
+      # Other
+      - VERBOSE=true
+    command: >
+      bash -c "
+      echo 'Testing Docker image...';
+      python convert_hf_to_arc_format.py --max_tasks 10 --verbose &&
+      echo 'Dataset conversion successful!'
+      "

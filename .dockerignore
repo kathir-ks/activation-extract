@@ -1,0 +1,47 @@
+# Docker ignore file
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Test outputs
+test_*/
+activations_*/
+logs/
+*.log
+
+# Data files (too large)
+*.jsonl
+*.json
+*.pkl
+*.pkl.gz
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# Temporary files
+*.tmp
+*.bak

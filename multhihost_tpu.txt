@@ -1,0 +1,16 @@
+
+ ▐▛███▜▌   Claude Code v2.0.36
+▝▜█████▛▘  Sonnet 4.5 · Claude Pro
+  ▘▘ ▝▝    /home/kathirks_gc/torch_xla/qwen
+════════════════════════ Conversation compacted · ctrl+o for history ═══════════════════════
+
+> /compact 
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read launch_v5e64.sh (153 lines)
+  ⎿  Read Dockerfile (65 lines)
+  ⎿  Read README_V5E64.md (301 lines)
+  ⎿  Read .dockerignore (48 lines)
+  ⎿  Read docker-compose.yml (39 lines)
+
+
+

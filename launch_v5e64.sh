@@ -30,10 +30,10 @@ export MAX_SEQ_LENGTH=2048                  # Max sequence length
 export MESH_TYPE="2d"                       # Mesh type: 1d, 2d, or 3d
 
 # GCS Configuration (REQUIRED for v5e-64)
-export GCS_BUCKET="your-bucket-name"        # REPLACE WITH YOUR BUCKET
-export GCS_PREFIX="activations_arc_v5e64"   # Prefix in bucket
-export SHARD_SIZE_GB=1.0                    # Shard size in GB
-export DELETE_LOCAL=true                    # Delete local files after upload
+export GCS_BUCKET="fineweb-data-us-central1-a"  # Your GCS bucket
+export GCS_PREFIX="activations_arc_v5e64"       # Prefix in bucket
+export SHARD_SIZE_GB=1.0                        # Shard size in GB (1000 MB)
+export DELETE_LOCAL=true                        # Delete local files after upload
 
 # Multi-Machine Configuration (if running on multiple v5e-64 machines)
 export MACHINE_ID=${MACHINE_ID:-0}          # This machine's ID

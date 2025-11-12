@@ -1,0 +1,113 @@
+/usr/lib/python3/dist-packages/pytz/__init__.py:31: SyntaxWarning: invalid escape sequence '\s'
+  match = re.match("^#\s*version\s*([0-9a-z]*)\s*$", line)
+======================================================================
+ARC ACTIVATION EXTRACTION ON TPU v5e-64 - MACHINE 0
+======================================================================
+{
+  "machine_id": 0,
+  "total_machines": 1,
+  "model_path": "KathirKs/qwen-2.5-0.5b",
+  "dataset_path": "test_gcs_dataset.jsonl",
+  "max_tasks": null,
+  "grid_encoder": "GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))",
+  "prompt_version": "output-from-examples-v0",
+  "predictions_per_task": 8,
+  "layers_to_extract": null,
+  "batch_size": 2,
+  "max_seq_length": 512,
+  "output_dir": "./test_1gb_output",
+  "upload_to_gcs": true,
+  "gcs_bucket": "fineweb-data-us-central1-a",
+  "gcs_prefix": "test_1gb_shards/machine_000",
+  "shard_size_gb": 1.0,
+  "compress_shards": true,
+  "delete_local_after_upload": false,
+  "multihost": false,
+  "coordinator_address": null,
+  "host_id": 0,
+  "num_hosts": 1,
+  "mesh_type": "2d",
+  "random_seed": 42,
+  "verbose": true,
+  "use_data_parallel": true
+}
+======================================================================
+
+Machine 0 - Found 4 device(s): ['TPU v4', 'TPU v4', 'TPU v4', 'TPU v4']
+
+Loading ARC dataset from test_gcs_dataset.jsonl...
+  Machine 0/0
+  Max tasks per machine: unlimited
+  ✓ Loaded 2 tasks
+
+Detecting model configuration from KathirKs/qwen-2.5-0.5b...
+  ✓ Loaded config: qwen2
+    Layers: 24, Hidden: 896
+    Using default layers: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+Loading tokenizer and model...
+
+Setting up model sharding across 4 devices...
+  ✓ Mesh: ('data', 'model'), shape: (1, 4)
+  ✓ Sharding strategy: 12 rules
+  ⟳ Sharding parameters...
+  ✓ Parameters sharded
+
+Creating grid encoder: GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))
+
+Creating prompts...
+Creating prompts:   0%|          | 0/2 [00:00<?, ?it/s]Creating prompts: 100%|██████████| 2/2 [00:00<00:00, 44.03it/s]
+  ✓ Created 9 prompts
+
+Tokenizing prompts...
+Tokenizing:   0%|          | 0/9 [00:00<?, ?it/s]Tokenizing:  89%|████████▉ | 8/9 [00:00<00:00, 75.38it/s]Tokenizing: 100%|██████████| 9/9 [00:00<00:00, 77.64it/s]
+/usr/lib/python3/dist-packages/blinker/base.py:96: SyntaxWarning: invalid escape sequence '\*'
+  `sender=` as a single positional argument and any \*\*kwargs that
+/usr/lib/python3/dist-packages/blinker/base.py:174: SyntaxWarning: invalid escape sequence '\*'
+  `sender=` as a single positional argument and any \*\*kwargs that
+/usr/lib/python3/dist-packages/blinker/base.py:242: SyntaxWarning: invalid escape sequence '\*'
+  """Emit this signal on behalf of *sender*, passing on \*\*kwargs.
+
+Creating batches (batch_size=2)...
+  ✓ 5 batches
+✓ fsspec GCS filesystem initialized for bucket: fineweb-data-us-central1-a
+
+Extracting activations...
+  Mode: Sharded (2D mesh: ('data', 'model'))
+Processing batches:   0%|          | 0/5 [00:00<?, ?it/s]Processing batches:  20%|██        | 1/5 [00:21<01:24, 21.24s/it]Processing batches:  60%|██████    | 3/5 [00:21<00:11,  5.57s/it]Processing batches: 100%|██████████| 5/5 [00:21<00:00,  2.74s/it]Processing batches: 100%|██████████| 5/5 [00:21<00:00,  4.31s/it]
+
+======================================================================
+Saving shard 1: shard_0001.pkl.gz (~220.6 MB)
+======================================================================
+  ✓ Saved locally: 205.0 MB
+    Layer 10: 9 samples
+    Layer 11: 9 samples
+    Layer 12: 9 samples
+    Layer 13: 9 samples
+    Layer 14: 9 samples
+    Layer 15: 9 samples
+    Layer 16: 9 samples
+    Layer 17: 9 samples
+    Layer 18: 9 samples
+    Layer 19: 9 samples
+    Layer 20: 9 samples
+    Layer 21: 9 samples
+    Layer 22: 9 samples
+    Layer 23: 9 samples
+  ⬆ Uploading to gs://fineweb-data-us-central1-a/test_1gb_shards/machine_000/shard_0001.pkl.gz...
+  ✓ Uploaded to GCS: gs://fineweb-data-us-central1-a/test_1gb_shards/machine_000/shard_0001.pkl.gz
+
+======================================================================
+STORAGE SUMMARY
+======================================================================
+  Total shards: 1
+  Total samples: 126
+  Metadata: test_1gb_output/metadata.json
+  GCS bucket: gs://fineweb-data-us-central1-a/test_1gb_shards/machine_000/
+======================================================================
+
+======================================================================
+MACHINE 0 - EXTRACTION COMPLETE!
+  Activations saved to: ./test_1gb_output
+  GCS path: gs://fineweb-data-us-central1-a/test_1gb_shards/machine_000/
+======================================================================

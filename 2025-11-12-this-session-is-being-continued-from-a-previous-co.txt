@@ -1,0 +1,16 @@
+
+ ▐▛███▜▌   Claude Code v2.0.37
+▝▜█████▛▘  Sonnet 4.5 · Claude Pro
+  ▘▘ ▝▝    /home/kathirks_gc/torch_xla/qwen
+═══════════════════════════════════════════ Conversation compacted · ctrl+o for history ═══════════════════════════════════════════
+
+> /compact 
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read JIT_PERFORMANCE_ANALYSIS.md (473 lines)
+  ⎿  Referenced file MULTIHOST_DEPLOYMENT.md
+  ⎿  Read test_docker_gcs/metadata.json (51 lines)
+  ⎿  Read Dockerfile (70 lines)
+  ⎿  Read test_1gb_native.log (114 lines)
+
+
+

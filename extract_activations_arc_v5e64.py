@@ -248,7 +248,7 @@ def create_prompts_from_dataset(
 def process_batch(model, params, sequences, sample_indices, prompts_data,
                   storage, layers_to_extract, pad_token_id,
                   batch_size=None, max_seq_length=None):
-    """Process a single batch of sequences with padding"""
+    """Process a single batch of sequences with padding and optimized transfers"""
     # Pad batch dimension
     actual_batch_size = len(sequences)
     if batch_size is not None and actual_batch_size < batch_size:
@@ -259,18 +259,27 @@ def process_batch(model, params, sequences, sample_indices, prompts_data,
     padded = pad_sequences(sequences, pad_token_id=pad_token_id, fixed_length=max_seq_length)
     input_ids = jnp.array(padded)
 
-    # Forward pass
+    # Forward pass (JIT-compiled)
     activations = extract_activations_sharded(model, params, input_ids)
+
+    # Vectorized async device→host transfer for all layers at once
+    # This overlaps TPU computation with host transfers
+    host_activations = {}
+    for layer_idx in layers_to_extract:
+        layer_key = f'layer_{layer_idx}'
+        if layer_key in activations:
+            # jax.device_get starts async transfer, returns immediately
+            host_activations[layer_key] = jax.device_get(activations[layer_key])
 
     # Process only actual samples
     for i, sample_idx in enumerate(sample_indices):
         prompt_data = prompts_data[sample_idx]
 
-        # Extract activations for each layer
+        # Extract activations for each layer (already on host)
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
-            if layer_key in activations:
-                layer_act = activations[layer_key][i]
+            if layer_key in host_activations:
+                layer_act = host_activations[layer_key][i]
                 layer_act_np = np.array(layer_act)
 
                 # Store with task_id and prompt
@@ -338,6 +347,12 @@ def main():
         config_dict['use_data_parallel'] = not config_dict.pop('no_data_parallel')
 
     cfg = ActivationExtractionConfig(**config_dict)
+
+    # Enable JIT compilation logging for performance verification
+    jax.config.update('jax_log_compiles', True)
+    if cfg.verbose:
+        print("\n[Performance] JIT compilation logging enabled")
+        print("[Performance] Watch for 'Compiling...' messages - should only appear once per unique shape")
 
     print("="*70)
     print(f"ARC ACTIVATION EXTRACTION ON TPU v5e-64 - MACHINE {cfg.machine_id}")

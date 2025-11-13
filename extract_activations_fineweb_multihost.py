@@ -836,7 +836,7 @@ def extract_activations_with_sharding(model, params, dataset, tokenizer,
                     max_seq_length=max_seq_length
                 )
 
-                batch_sequences = []
+                batch_sequencnes = []
                 batch_sample_indices = []
                 batch_text_previews = []
 

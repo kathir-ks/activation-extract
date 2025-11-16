@@ -44,18 +44,28 @@ RUN pip install --no-cache-dir \
     matplotlib \
     termcolor
 
-# Copy application code
+# Copy core model code
 COPY kvcache_utils.py /workspace/
 COPY qwen2_jax.py /workspace/
 COPY qwen2_jax_with_hooks.py /workspace/
+
+# Copy extraction scripts (refactored + legacy)
+COPY extract_activations.py /workspace/
 COPY extract_activations_arc_v5e64.py /workspace/
 COPY extract_activations_fineweb_multihost.py /workspace/
+
+# Copy dataset utilities
 COPY convert_hf_to_arc_format.py /workspace/
 COPY create_sharded_dataset.py /workspace/
 COPY shard_manager.py /workspace/
+
+# Copy core utilities (refactored shared code)
+COPY core/ /workspace/core/
+
+# Copy launch script
 COPY launch_v5e64.sh /workspace/
 
-# Copy ARC utilities (if available)
+# Copy ARC utilities
 COPY arc24/ /workspace/arc24/
 
 # Create cache directory for HuggingFace models

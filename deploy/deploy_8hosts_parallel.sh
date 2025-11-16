@@ -25,7 +25,7 @@ export TPU_NAME="v5e-main-1"  # CHANGE THIS to your TPU name
 export AR_REGION="us-central1"
 export AR_REPO="arc-agi-us-central1"  # CHANGE THIS to your repo name
 export IMAGE_TAG="activation-extraction"
-export IMAGE_PATH="${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction:${IMAGE_TAG}"
+export IMAGE_PATH="${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction"
 
 # Dataset Configuration
 export DATASET_PATH="gs://fineweb-data-us-central1-a/datasets/arc_barc200k_test_1k.jsonl"
@@ -239,39 +239,30 @@ cleanup_old_containers() {
 ################################################################################
 
 deploy_all_hosts() {
-    log_section "Deploying to All 8 Hosts"
-    
+    log_section "Deploying to All 8 Hosts Simultaneously"
+
     log_info "Starting deployment..."
     log_info "Coordinator: ${COORDINATOR_ADDRESS}"
     log_info "Mesh type: ${MESH_TYPE}"
     log_info "Dataset: ${DATASET_PATH}"
     log_info "Model: ${MODEL_PATH}"
-    
+
     local pids=()
-    
-    # Deploy host 0 (coordinator) first
-    log_info "${YELLOW}Deploying Host 0 (Coordinator)...${NC}"
-    deploy_single_host 0 &
-    pids+=($!)
-    
-    # Wait for coordinator to start
-    log_info "Waiting 30 seconds for coordinator to initialize..."
-    sleep 30
-    
-    # Deploy remaining hosts in parallel
-    for host_id in {1..7}; do
-        log_info "Deploying Host ${host_id}..."
+
+    # Deploy all 8 hosts simultaneously (including coordinator)
+    log_info "Deploying all 8 hosts in parallel..."
+    for host_id in {0..7}; do
+        log_info "Deploying Host ${host_id}$([ ${host_id} -eq 0 ] && echo ' (Coordinator)' || echo '')..."
         deploy_single_host ${host_id} &
         pids+=($!)
-        sleep 2  # Small delay between deployments
     done
-    
+
     # Wait for all deployments
     log_info "Waiting for all deployments to complete..."
     for pid in ${pids[@]}; do
         wait $pid
     done
-    
+
     log_success "All hosts deployed successfully!"
 }
 

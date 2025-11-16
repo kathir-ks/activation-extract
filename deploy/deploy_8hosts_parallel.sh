@@ -247,11 +247,24 @@ deploy_all_hosts() {
     log_info "Dataset: ${DATASET_PATH}"
     log_info "Model: ${MODEL_PATH}"
 
+    # First, verify how many workers actually exist
+    log_info "Verifying number of TPU workers..."
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
+    log_info "TPU has ${ACTUAL_WORKERS} workers"
+
+    if [ ${ACTUAL_WORKERS} -lt ${NUM_HOSTS} ]; then
+        log_warning "TPU only has ${ACTUAL_WORKERS} workers, but NUM_HOSTS is set to ${NUM_HOSTS}"
+        log_warning "Deploying to ${ACTUAL_WORKERS} workers only"
+        local max_host=$((ACTUAL_WORKERS - 1))
+    else
+        local max_host=7
+    fi
+
     local pids=()
 
-    # Deploy all 8 hosts simultaneously (including coordinator)
-    log_info "Deploying all 8 hosts in parallel..."
-    for host_id in {0..7}; do
+    # Deploy all hosts simultaneously (including coordinator)
+    log_info "Deploying to hosts 0-${max_host} in parallel..."
+    for host_id in $(seq 0 ${max_host}); do
         log_info "Deploying Host ${host_id}$([ ${host_id} -eq 0 ] && echo ' (Coordinator)' || echo '')..."
         deploy_single_host ${host_id} &
         pids+=($!)
@@ -259,11 +272,18 @@ deploy_all_hosts() {
 
     # Wait for all deployments
     log_info "Waiting for all deployments to complete..."
+    local failed=0
     for pid in ${pids[@]}; do
-        wait $pid
+        if ! wait $pid; then
+            ((failed++))
+        fi
     done
 
-    log_success "All hosts deployed successfully!"
+    if [ $failed -eq 0 ]; then
+        log_success "All hosts deployed successfully!"
+    else
+        log_warning "${failed} host(s) failed to deploy"
+    fi
 }
 
 ################################################################################
@@ -350,10 +370,10 @@ deploy_single_host() {
 
 monitor_progress() {
     log_section "Monitoring Progress"
-    
+
     log_info "Checking status on all hosts..."
     echo ""
-    
+
     for host_id in {0..7}; do
         echo -e "${CYAN}Host ${host_id}:${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -367,7 +387,7 @@ monitor_progress() {
                 else
                     echo '  Status: ✗ Not running'
                 fi
-            " 2>/dev/null
+            " 2>/dev/null || echo "  Status: ⚠ Cannot connect to host"
         echo ""
     done
     
@@ -429,17 +449,47 @@ stop_all() {
 }
 
 ################################################################################
+# CHECK TPU INFO
+################################################################################
+
+check_tpu_info() {
+    log_section "TPU Configuration"
+
+    log_info "Checking TPU: ${TPU_NAME}"
+
+    # Get TPU details
+    sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+        --format="yaml(acceleratorType,state,networkEndpoints)" || {
+        log_error "Failed to get TPU information"
+        return 1
+    }
+
+    echo ""
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
+    log_info "Total workers: ${ACTUAL_WORKERS}"
+
+    echo ""
+    log_info "Worker IPs:"
+    sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+        --format="table(networkEndpoints.ipAddress,networkEndpoints.port)"
+}
+
+################################################################################
 # CHECK STATUS
 ################################################################################
 
 check_status() {
     log_section "Container Status on All Hosts"
 
+    # Get actual number of workers
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 8)
+    local max_host=$((ACTUAL_WORKERS - 1))
+
     echo ""
     printf "%-8s %-15s %-20s %-15s\n" "Host" "Status" "Container ID" "Uptime"
     echo "------------------------------------------------------------------------"
 
-    for host_id in {0..7}; do
+    for host_id in $(seq 0 ${max_host}); do
         status=$(sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --zone=${ZONE} \
             --worker=${host_id} \
@@ -454,7 +504,7 @@ check_status() {
         container_id=$(echo "$status" | awk '{print $1}')
         uptime=$(echo "$status" | cut -f2-)
 
-        if [ "$container_id" == "STOPPED" ]; then
+        if [ "$container_id" == "STOPPED" ] || [ -z "$container_id" ]; then
             printf "%-8s %-15s %-20s %-15s\n" "$host_id" "❌ Stopped" "N/A" "N/A"
         else
             printf "%-8s %-15s %-20s %-15s\n" "$host_id" "✓ Running" "$container_id" "$uptime"
@@ -485,23 +535,27 @@ main() {
             sleep 10
             monitor_progress
             ;;
-        
+
         monitor)
             monitor_progress
             ;;
-        
+
         logs)
             view_logs "${2:-50}"
             ;;
-        
+
         status)
             check_status
             ;;
-        
+
+        info|tpu-info)
+            check_tpu_info
+            ;;
+
         stop)
             stop_all
             ;;
-        
+
         restart)
             stop_all
             sleep 5
@@ -511,15 +565,16 @@ main() {
             sleep 10
             monitor_progress
             ;;
-        
+
         *)
-            echo "Usage: $0 {deploy|monitor|logs|status|stop|restart}"
+            echo "Usage: $0 {deploy|monitor|logs|status|info|stop|restart}"
             echo ""
             echo "Commands:"
-            echo "  deploy   - Full deployment to all 8 hosts (default)"
+            echo "  deploy   - Full deployment to all hosts (default)"
             echo "  monitor  - Check current progress on all hosts"
             echo "  logs     - View logs from all hosts (usage: $0 logs [num_lines])"
             echo "  status   - Show container status on all hosts"
+            echo "  info     - Show TPU configuration and worker count"
             echo "  stop     - Stop all containers"
             echo "  restart  - Stop and redeploy all containers"
             exit 1

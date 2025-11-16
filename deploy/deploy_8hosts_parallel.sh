@@ -104,31 +104,31 @@ preflight_checks() {
         exit 1
     fi
     log_success "gcloud CLI found"
-    
+
     # Check if TPU exists
     log_info "Checking if TPU ${TPU_NAME} exists..."
-    if ! gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} &> /dev/null; then
+    if ! sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} &> /dev/null; then
         log_error "TPU ${TPU_NAME} not found in zone ${ZONE}"
         exit 1
     fi
     log_success "TPU ${TPU_NAME} found"
-    
+
     # Check dataset exists
     log_info "Checking if dataset exists..."
-    if ! gsutil ls ${DATASET_PATH} &> /dev/null; then
+    if ! sudo gsutil ls ${DATASET_PATH} &> /dev/null; then
         log_error "Dataset not found: ${DATASET_PATH}"
         log_info "Please create dataset first using:"
         log_info "  python convert_hf_to_arc_format.py --output_file dataset.jsonl"
         exit 1
     fi
     log_success "Dataset found: ${DATASET_PATH}"
-    
+
     # Check GCS bucket exists
     log_info "Checking if GCS bucket exists..."
-    if ! gsutil ls gs://${GCS_BUCKET}/ &> /dev/null; then
+    if ! sudo gsutil ls gs://${GCS_BUCKET}/ &> /dev/null; then
         log_error "GCS bucket not found: gs://${GCS_BUCKET}/"
         log_info "Creating bucket..."
-        gsutil mb -p ${PROJECT_ID} -c STANDARD -l ${ZONE%%-*} gs://${GCS_BUCKET}/
+        sudo gsutil mb -p ${PROJECT_ID} -c STANDARD -l ${ZONE%%-*} gs://${GCS_BUCKET}/
         log_success "Bucket created"
     else
         log_success "GCS bucket found"
@@ -141,18 +141,18 @@ preflight_checks() {
 
 get_coordinator_ip() {
     log_section "Getting Coordinator IP"
-    
+
     log_info "Querying worker-0 for internal IP..."
-    COORDINATOR_IP=$(gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    COORDINATOR_IP=$(sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
         --zone=${ZONE} \
         --worker=0 \
         --command="hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n ')
-    
+
     if [ -z "$COORDINATOR_IP" ]; then
         log_error "Failed to get coordinator IP"
         exit 1
     fi
-    
+
     export COORDINATOR_ADDRESS="${COORDINATOR_IP}:${COORDINATOR_PORT}"
     log_success "Coordinator address: ${COORDINATOR_ADDRESS}"
 }
@@ -163,37 +163,37 @@ get_coordinator_ip() {
 
 pull_docker_images() {
     log_section "Pulling Docker Images on All Hosts"
-    
+
     log_info "Authenticating Docker with Artifact Registry..."
-    gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev --quiet
-    
+    sudo gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev --quiet
+
     local pids=()
-    
+
     for host_id in {0..7}; do
         log_info "Pulling image on host ${host_id}..."
         (
-            gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
                     echo 'Host ${host_id}: Configuring Docker auth...'
-                    gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev --quiet
-                    
+                    sudo gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev --quiet
+
                     echo 'Host ${host_id}: Pulling image...'
-                    docker pull ${IMAGE_PATH}
-                    
+                    sudo docker pull ${IMAGE_PATH}
+
                     echo 'Host ${host_id}: Image pulled successfully'
                 " 2>&1 | sed "s/^/[Host ${host_id}] /"
         ) &
         pids+=($!)
     done
-    
+
     # Wait for all pulls to complete
     log_info "Waiting for all image pulls to complete..."
     for pid in ${pids[@]}; do
         wait $pid
     done
-    
+
     log_success "All images pulled successfully"
 }
 
@@ -203,34 +203,34 @@ pull_docker_images() {
 
 cleanup_old_containers() {
     log_section "Cleaning Up Old Containers"
-    
+
     local pids=()
-    
+
     for host_id in {0..7}; do
         log_info "Cleaning up host ${host_id}..."
         (
-            gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
                     # Stop and remove old containers
-                    docker stop extraction-host${host_id} 2>/dev/null || true
-                    docker rm extraction-host${host_id} 2>/dev/null || true
-                    
+                    sudo docker stop extraction-host${host_id} 2>/dev/null || true
+                    sudo docker rm extraction-host${host_id} 2>/dev/null || true
+
                     # Clean up old output (optional)
                     # rm -rf ~/data/output 2>/dev/null || true
-                    
+
                     echo 'Host ${host_id}: Cleanup complete'
                 " 2>&1 | sed "s/^/[Host ${host_id}] /"
         ) &
         pids+=($!)
     done
-    
+
     # Wait for all cleanups
     for pid in ${pids[@]}; do
         wait $pid
     done
-    
+
     log_success "Cleanup complete on all hosts"
 }
 
@@ -294,17 +294,17 @@ deploy_single_host() {
         layers_arg="--layers_to_extract ${LAYERS_TO_EXTRACT}"
     fi
     
-    gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+    sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
         --zone=${ZONE} \
         --worker=${host_id} \
         --command="
             echo '========================================================================'
             echo 'Host ${host_id}: Starting extraction container'
             echo '========================================================================'
-            
+
             # Create data directory
             mkdir -p ~/data/output
-            
+
             # Run Docker container
             sudo docker run -d \
                 --name extraction-host${host_id} \
@@ -336,16 +336,16 @@ deploy_single_host() {
                     ${COMPRESS_SHARDS} \
                     ${DELETE_LOCAL} \
                     ${VERBOSE}\"
-            
+
             echo 'Host ${host_id}: Container started'
-            
+
             # Wait a moment and check if container is running
             sleep 5
-            if docker ps | grep -q extraction-host${host_id}; then
+            if sudo docker ps | grep -q extraction-host${host_id}; then
                 echo 'Host ${host_id}: ✓ Container running successfully'
             else
                 echo 'Host ${host_id}: ✗ Container failed to start'
-                docker logs extraction-host${host_id}
+                sudo docker logs extraction-host${host_id}
                 exit 1
             fi
         " 2>&1 | sed "s/^/[Host ${host_id}] /"
@@ -365,14 +365,14 @@ monitor_progress() {
     
     for host_id in {0..7}; do
         echo -e "${CYAN}Host ${host_id}:${NC}"
-        gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --zone=${ZONE} \
             --worker=${host_id} \
             --command="
-                if docker ps | grep -q extraction-host${host_id}; then
+                if sudo docker ps | grep -q extraction-host${host_id}; then
                     echo '  Status: ✓ Running'
                     echo '  Last 3 log lines:'
-                    docker logs --tail 3 extraction-host${host_id} 2>&1 | sed 's/^/    /'
+                    sudo docker logs --tail 3 extraction-host${host_id} 2>&1 | sed 's/^/    /'
                 else
                     echo '  Status: ✗ Not running'
                 fi
@@ -381,10 +381,10 @@ monitor_progress() {
     done
     
     log_info "To view detailed logs for a specific host:"
-    log_info "  gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 --command='docker logs -f extraction-host0'"
-    
+    log_info "  sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 --command='sudo docker logs -f extraction-host0'"
+
     log_info "To check GCS output:"
-    log_info "  gsutil ls -lh gs://${GCS_BUCKET}/${GCS_PREFIX}/"
+    log_info "  sudo gsutil ls -lh gs://${GCS_BUCKET}/${GCS_PREFIX}/"
 }
 
 ################################################################################
@@ -393,16 +393,16 @@ monitor_progress() {
 
 view_logs() {
     log_section "Viewing Logs from All Hosts"
-    
+
     local lines=${1:-50}  # Default 50 lines
-    
+
     for host_id in {0..7}; do
         echo ""
         echo -e "${MAGENTA}========== Host ${host_id} (Last ${lines} lines) ==========${NC}"
-        gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --zone=${ZONE} \
             --worker=${host_id} \
-            --command="docker logs --tail ${lines} extraction-host${host_id} 2>&1" 2>/dev/null || true
+            --command="sudo docker logs --tail ${lines} extraction-host${host_id} 2>&1" 2>/dev/null || true
     done
 }
 
@@ -412,28 +412,28 @@ view_logs() {
 
 stop_all() {
     log_section "Stopping All Containers"
-    
+
     local pids=()
-    
+
     for host_id in {0..7}; do
         log_info "Stopping host ${host_id}..."
         (
-            gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
-                    docker stop extraction-host${host_id} 2>/dev/null || true
-                    docker rm extraction-host${host_id} 2>/dev/null || true
+                    sudo docker stop extraction-host${host_id} 2>/dev/null || true
+                    sudo docker rm extraction-host${host_id} 2>/dev/null || true
                     echo 'Host ${host_id}: Stopped'
                 " 2>&1 | sed "s/^/[Host ${host_id}] /"
         ) &
         pids+=($!)
     done
-    
+
     for pid in ${pids[@]}; do
         wait $pid
     done
-    
+
     log_success "All containers stopped"
 }
 
@@ -443,33 +443,33 @@ stop_all() {
 
 check_status() {
     log_section "Container Status on All Hosts"
-    
+
     echo ""
     printf "%-8s %-15s %-20s %-15s\n" "Host" "Status" "Container ID" "Uptime"
     echo "------------------------------------------------------------------------"
-    
+
     for host_id in {0..7}; do
-        status=$(gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        status=$(sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --zone=${ZONE} \
             --worker=${host_id} \
             --command="
-                if docker ps --format '{{.ID}}\t{{.Status}}' | grep extraction-host${host_id} &>/dev/null; then
-                    docker ps --format '{{.ID}}\t{{.Status}}' | grep extraction-host${host_id}
+                if sudo docker ps --format '{{.ID}}\t{{.Status}}' | grep extraction-host${host_id} &>/dev/null; then
+                    sudo docker ps --format '{{.ID}}\t{{.Status}}' | grep extraction-host${host_id}
                 else
                     echo 'STOPPED\tN/A'
                 fi
             " 2>/dev/null)
-        
+
         container_id=$(echo "$status" | awk '{print $1}')
         uptime=$(echo "$status" | cut -f2-)
-        
+
         if [ "$container_id" == "STOPPED" ]; then
             printf "%-8s %-15s %-20s %-15s\n" "$host_id" "❌ Stopped" "N/A" "N/A"
         else
             printf "%-8s %-15s %-20s %-15s\n" "$host_id" "✓ Running" "$container_id" "$uptime"
         fi
     done
-    
+
     echo ""
 }
 

@@ -17,6 +17,23 @@ gcloud config set project $PROJECT_ID
 gcloud auth configure-docker
 ```
 
+### 2.5. Prepare Dataset (see DATASET_GUIDE.md for details)
+```bash
+# Option A: Convert from HuggingFace
+python convert_hf_to_arc_format.py \
+  --dataset_name barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems \
+  --output_file dataset.jsonl \
+  --max_tasks 1000 \
+  --verbose
+
+# Option B: Use existing dataset file
+
+# Upload to GCS
+export BUCKET="your-bucket-name"
+gsutil mb -p $PROJECT_ID -c STANDARD -l us-central1 gs://${BUCKET}
+gsutil cp dataset.jsonl gs://${BUCKET}/
+```
+
 ### 3. Build and Push Docker Image
 ```bash
 # Build

@@ -51,6 +51,8 @@ COPY qwen2_jax_with_hooks.py /workspace/
 COPY extract_activations_arc_v5e64.py /workspace/
 COPY extract_activations_fineweb_multihost.py /workspace/
 COPY convert_hf_to_arc_format.py /workspace/
+COPY create_sharded_dataset.py /workspace/
+COPY shard_manager.py /workspace/
 COPY launch_v5e64.sh /workspace/
 
 # Copy ARC utilities (if available)

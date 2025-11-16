@@ -63,6 +63,9 @@ from extract_activations_fineweb_multihost import (
     extract_activations_sharded
 )
 
+# Import shard manager
+from shard_manager import ShardManager, load_shard_chunks
+
 # Alias for convenience
 P = PartitionSpec
 
@@ -80,6 +83,11 @@ class ActivationExtractionConfig:
     # Dataset config
     dataset_path: str = 'arc_formatted_challenges.jsonl'
     max_tasks: Optional[int] = None  # Max tasks to process
+
+    # Sharded dataset support
+    use_sharded_dataset: bool = False  # Use sharded dataset with auto shard claiming
+    sharded_dataset_dir: Optional[str] = None  # Directory containing sharded dataset
+    preferred_shard_id: Optional[int] = None  # Preferred shard ID (auto-select if None)
 
     # Prompt config
     grid_encoder: str = 'GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))'
@@ -130,6 +138,78 @@ class ActivationExtractionConfig:
             if self.multihost:
                 prefix += f"_host_{self.host_id:02d}"
             self.gcs_prefix = prefix
+
+
+def load_arc_dataset_from_shard(
+    sharded_dataset_dir: str,
+    worker_id: str,
+    preferred_shard_id: Optional[int] = None,
+    verbose: bool = False
+) -> Tuple[Dict, int, ShardManager]:
+    """
+    Load ARC dataset from sharded dataset with automatic shard claiming
+
+    Args:
+        sharded_dataset_dir: Directory containing sharded dataset
+        worker_id: Unique worker identifier
+        preferred_shard_id: Preferred shard ID (auto-select if None)
+        verbose: Print progress
+
+    Returns:
+        Tuple of (tasks_dict, shard_id, shard_manager)
+    """
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"Loading from Sharded Dataset")
+        print(f"{'='*70}")
+        print(f"  Dataset dir: {sharded_dataset_dir}")
+        print(f"  Worker ID: {worker_id}")
+        if preferred_shard_id is not None:
+            print(f"  Preferred shard: {preferred_shard_id}")
+
+    # Initialize shard manager
+    shard_manager = ShardManager(sharded_dataset_dir, worker_id)
+
+    # Claim a shard
+    if verbose:
+        print(f"\n  Claiming shard...")
+
+    shard_info = shard_manager.claim_shard(preferred_shard_id)
+
+    if shard_info is None:
+        raise RuntimeError(
+            f"No available shards in {sharded_dataset_dir}. "
+            f"All shards may be in use or completed."
+        )
+
+    shard_id = shard_info["shard_id"]
+    chunk_files = shard_info["chunks"]
+    total_tasks = shard_info["metadata"]["total_tasks"]
+
+    if verbose:
+        print(f"  ✓ Claimed shard {shard_id}")
+        print(f"    Tasks: {total_tasks:,}")
+        print(f"    Chunks: {len(chunk_files)}")
+        print(f"\n  Loading tasks from chunks...")
+
+    # Load all tasks from chunks
+    is_gcs = sharded_dataset_dir.startswith("gs://")
+    task_list = load_shard_chunks(chunk_files, is_gcs)
+
+    # Convert to dict format
+    tasks = {}
+    for task_obj in task_list:
+        task_id = task_obj.get("task_id", f"task_{len(tasks):08x}")
+        tasks[task_id] = {
+            "train": task_obj["train"],
+            "test": task_obj["test"]
+        }
+
+    if verbose:
+        print(f"  ✓ Loaded {len(tasks):,} tasks from shard {shard_id}")
+        print(f"{'='*70}\n")
+
+    return tasks, shard_id, shard_manager
 
 
 def load_arc_dataset_jsonl(dataset_path: str, max_tasks: Optional[int] = None,
@@ -302,8 +382,16 @@ def main():
     parser.add_argument('--model_path', type=str, default="KathirKs/qwen-2.5-7b")
 
     # Dataset args
-    parser.add_argument('--dataset_path', type=str, required=True)
+    parser.add_argument('--dataset_path', type=str, help="Path to JSONL dataset file")
     parser.add_argument('--max_tasks', type=int, default=None)
+
+    # Sharded dataset args
+    parser.add_argument('--use_sharded_dataset', action='store_true',
+                       help="Use sharded dataset with automatic shard claiming")
+    parser.add_argument('--sharded_dataset_dir', type=str,
+                       help="Directory containing sharded dataset")
+    parser.add_argument('--preferred_shard_id', type=int,
+                       help="Preferred shard ID (auto-select if not specified)")
 
     # Prompt args
     parser.add_argument('--grid_encoder', type=str)
@@ -380,13 +468,34 @@ def main():
         set_random_seed(cfg.random_seed)
 
     # Load dataset
-    tasks = load_arc_dataset_jsonl(
-        cfg.dataset_path,
-        cfg.max_tasks,
-        cfg.machine_id,
-        cfg.total_machines,
-        cfg.verbose
-    )
+    shard_manager = None
+    claimed_shard_id = None
+
+    if cfg.use_sharded_dataset:
+        # Load from sharded dataset
+        if not cfg.sharded_dataset_dir:
+            raise ValueError("--sharded_dataset_dir required when using --use_sharded_dataset")
+
+        worker_id = f"machine{cfg.machine_id}_host{cfg.host_id if cfg.multihost else 0}"
+
+        tasks, claimed_shard_id, shard_manager = load_arc_dataset_from_shard(
+            cfg.sharded_dataset_dir,
+            worker_id,
+            cfg.preferred_shard_id,
+            cfg.verbose
+        )
+    else:
+        # Load from single JSONL file
+        if not cfg.dataset_path:
+            raise ValueError("--dataset_path required when not using sharded dataset")
+
+        tasks = load_arc_dataset_jsonl(
+            cfg.dataset_path,
+            cfg.max_tasks,
+            cfg.machine_id,
+            cfg.total_machines,
+            cfg.verbose
+        )
 
     # Auto-detect model config
     print(f"\nDetecting model configuration from {cfg.model_path}...")
@@ -519,8 +628,18 @@ def main():
     # Finalize
     storage.finalize()
 
+    # Mark shard as completed if using sharded dataset
+    if shard_manager is not None and claimed_shard_id is not None:
+        if cfg.verbose:
+            print(f"\nMarking shard {claimed_shard_id} as completed...")
+        shard_manager.mark_completed(claimed_shard_id)
+        if cfg.verbose:
+            print(f"  ✓ Shard {claimed_shard_id} marked as completed")
+
     print("\n" + "="*70)
     print(f"MACHINE {cfg.machine_id} - EXTRACTION COMPLETE!")
+    if claimed_shard_id is not None:
+        print(f"  Shard processed: {claimed_shard_id}")
     print(f"  Activations saved to: {cfg.output_dir}")
     if cfg.upload_to_gcs:
         print(f"  GCS path: gs://{cfg.gcs_bucket}/{cfg.gcs_prefix}/")

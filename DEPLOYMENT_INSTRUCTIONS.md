@@ -7,7 +7,7 @@ On your new machine/account, you need:
 - Docker installed
 - Access to a GCP project with:
   - TPU v5e-64 quota (or v4 for testing)
-  - Google Container Registry enabled
+  - Artifact Registry enabled
   - Cloud Storage bucket
 
 ---
@@ -55,8 +55,17 @@ gcloud auth login
 export PROJECT_ID="your-new-project-id"
 gcloud config set project $PROJECT_ID
 
-# Configure Docker to use GCR
-gcloud auth configure-docker
+# Set your region (choose based on your TPU location)
+export AR_REGION="us-central1"
+
+# Create Artifact Registry repository if it doesn't exist
+gcloud artifacts repositories create arc-agi-${AR_REGION} \
+  --repository-format=docker \
+  --location=${AR_REGION} \
+  --description="Docker repository for ARC-AGI activation extraction"
+
+# Configure Docker to use Artifact Registry
+gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev
 ```
 
 ---
@@ -66,29 +75,36 @@ gcloud auth configure-docker
 ```bash
 cd /path/to/qwen
 
+# Set repository name and image path
+export AR_REPO="arc-agi-${AR_REGION}"
+export IMAGE_TAG="activation-extraction"
+export IMAGE_PATH="${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction:${IMAGE_TAG}"
+
 # Build the image
 docker build -t activation-extraction:latest .
 
-# Tag for GCR
-docker tag activation-extraction:latest \
-  gcr.io/${PROJECT_ID}/activation-extraction:latest
+# Tag for Artifact Registry
+docker tag activation-extraction:latest ${IMAGE_PATH}
 
-# Push to Google Container Registry
-docker push gcr.io/${PROJECT_ID}/activation-extraction:latest
+# Push to Artifact Registry
+docker push ${IMAGE_PATH}
 ```
 
 **Expected time:** Build ~10 min, Push ~5-8 min
+
+**Note:** If the repository doesn't exist, the push will fail. Make sure you created it in Step 2.
 
 ---
 
 ## Step 4: Create TPU VMs and Deploy
 
-### For TPU v5e-64 (4 hosts):
+### For TPU v5e-64 (8 hosts):
 
 ```bash
 export ZONE="us-central1-a"
 export TPU_NAME="arc-extraction"
 export BUCKET_NAME="your-bucket-name"
+export NUM_HOSTS=8  # v5e-64 has 8 hosts
 
 # Create TPU
 gcloud compute tpus tpu-vm create ${TPU_NAME} \
@@ -97,12 +113,15 @@ gcloud compute tpus tpu-vm create ${TPU_NAME} \
   --version=tpu-ubuntu2204-base
 
 # Get coordinator IP
-COORDINATOR_IP=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} \
+COORDINATOR_IP=$(gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
   --zone=${ZONE} \
-  --format='value(networkEndpoints[0].ipAddress)')
+  --worker=0 \
+  --command="hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n ')
+
+export COORDINATOR_ADDRESS="${COORDINATOR_IP}:8476"
 
 # Deploy to each worker
-for WORKER_ID in 0 1 2 3; do
+for WORKER_ID in {0..7}; do
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --worker=${WORKER_ID} \
@@ -110,10 +129,10 @@ for WORKER_ID in 0 1 2 3; do
       # Setup Docker
       sudo apt-get update && sudo apt-get install -y docker.io
       sudo usermod -aG docker \$USER
-      gcloud auth configure-docker
+      gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev
 
-      # Pull image
-      sudo docker pull gcr.io/${PROJECT_ID}/activation-extraction:latest
+      # Pull image from Artifact Registry
+      sudo docker pull ${IMAGE_PATH}
 
       # Run extraction
       mkdir -p ~/data ~/.cache/huggingface
@@ -122,12 +141,12 @@ for WORKER_ID in 0 1 2 3; do
         -v ~/data:/workspace/data \
         -v ~/.config/gcloud:/root/.config/gcloud:ro \
         -v ~/.cache/huggingface:/cache/huggingface \
-        gcr.io/${PROJECT_ID}/activation-extraction:latest \
+        ${IMAGE_PATH} \
         -c \"python /workspace/extract_activations_arc_v5e64.py \
           --host_id ${WORKER_ID} \
-          --num_hosts 4 \
+          --num_hosts ${NUM_HOSTS} \
           --multihost \
-          --coordinator_address ${COORDINATOR_IP}:8476 \
+          --coordinator_address ${COORDINATOR_ADDRESS} \
           --dataset_path gs://${BUCKET_NAME}/dataset.jsonl \
           --model_path KathirKs/qwen-2.5-0.5b \
           --batch_size 4 \
@@ -137,6 +156,17 @@ for WORKER_ID in 0 1 2 3; do
           --verbose\"
     " &
 done
+```
+
+**Alternative: Use the Automated Deployment Script**
+
+For easier deployment, use the provided deployment script:
+
+```bash
+# Edit deploy/deploy_8hosts_parallel.sh to set your configuration
+# Then run:
+cd /path/to/qwen
+./deploy/deploy_8hosts_parallel.sh deploy
 ```
 
 ---
@@ -150,6 +180,11 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 \
 
 # Check GCS output
 gsutil ls -lh gs://${BUCKET_NAME}/activations/
+
+# Or use the deployment script
+./deploy/deploy_8hosts_parallel.sh monitor
+./deploy/deploy_8hosts_parallel.sh status
+./deploy/deploy_8hosts_parallel.sh logs 100  # View last 100 lines from all hosts
 ```
 
 ---
@@ -158,7 +193,7 @@ gsutil ls -lh gs://${BUCKET_NAME}/activations/
 
 - **Warmup:** ~21 seconds (first batch, JIT compilation)
 - **Throughput:** ~5.7 seconds/batch (after warmup)
-- **4-host run:** ~47 minutes for 8,000 samples
+- **8-host run:** ~23-25 minutes for 8,000 samples (approximately 2x faster than 4-host)
 
 ---
 
@@ -166,11 +201,49 @@ gsutil ls -lh gs://${BUCKET_NAME}/activations/
 
 ```bash
 # Stop containers
-for i in 0 1 2 3; do
+for i in {0..7}; do
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i \
-    --command="sudo docker stop extraction"
+    --command="sudo docker stop extraction && sudo docker rm extraction"
 done
+
+# Or use the deployment script
+./deploy/deploy_8hosts_parallel.sh stop
 
 # Delete TPU
 gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE}
+```
+
+---
+
+## Troubleshooting
+
+### If Artifact Registry repository doesn't exist:
+```bash
+# List existing repositories
+gcloud artifacts repositories list --location=${AR_REGION}
+
+# Create if needed
+gcloud artifacts repositories create arc-agi-${AR_REGION} \
+  --repository-format=docker \
+  --location=${AR_REGION}
+```
+
+### If Docker authentication fails:
+```bash
+# Re-authenticate
+gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev --quiet
+
+# Verify you can access the repository
+gcloud artifacts docker images list ${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/arc-agi-${AR_REGION}
+```
+
+### If containers fail to start:
+```bash
+# Check container logs
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 \
+  --command="sudo docker logs extraction"
+
+# Check if container exists
+gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 \
+  --command="sudo docker ps -a"
 ```

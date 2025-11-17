@@ -455,23 +455,37 @@ stop_all() {
 check_tpu_info() {
     log_section "TPU Configuration"
 
-    log_info "Checking TPU: ${TPU_NAME}"
+    log_info "Checking TPU: ${TPU_NAME} in zone: ${ZONE}"
 
     # Get TPU details
-    sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
-        --format="yaml(acceleratorType,state,networkEndpoints)" || {
-        log_error "Failed to get TPU information"
+    if ! gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+        --format="yaml(acceleratorType,state,networkEndpoints)" 2>&1; then
+        log_error "Failed to get TPU information. Check TPU_NAME and ZONE settings."
         return 1
-    }
+    fi
 
     echo ""
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
+    ACTUAL_WORKERS=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" 2>/dev/null | wc -l)
+    if [ -z "$ACTUAL_WORKERS" ] || [ "$ACTUAL_WORKERS" -eq 0 ]; then
+        log_error "Could not determine number of workers"
+        return 1
+    fi
     log_info "Total workers: ${ACTUAL_WORKERS}"
 
     echo ""
     log_info "Worker IPs:"
-    sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+    gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
         --format="table(networkEndpoints.ipAddress,networkEndpoints.port)"
+
+    echo ""
+    log_info "Testing SSH connectivity to each worker..."
+    for i in $(seq 0 $((ACTUAL_WORKERS - 1))); do
+        if gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i --command="echo -n 'Worker $i: '; hostname" 2>/dev/null; then
+            log_success "Worker $i: SSH OK"
+        else
+            log_error "Worker $i: SSH FAILED"
+        fi
+    done
 }
 
 ################################################################################

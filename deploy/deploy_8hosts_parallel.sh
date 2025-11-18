@@ -107,7 +107,7 @@ preflight_checks() {
 
     # Check if TPU exists
     log_info "Checking if TPU ${TPU_NAME} exists..."
-    if ! sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} &> /dev/null; then
+    if ! sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} &> /dev/null; then
         log_error "TPU ${TPU_NAME} not found in zone ${ZONE}"
         exit 1
     fi
@@ -144,6 +144,7 @@ get_coordinator_ip() {
 
     log_info "Querying worker-0 for internal IP..."
     COORDINATOR_IP=$(sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        --project=${PROJECT_ID} \
         --zone=${ZONE} \
         --worker=0 \
         --command="hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n ')
@@ -173,6 +174,7 @@ pull_docker_images() {
         log_info "Pulling image on host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+                --project=${PROJECT_ID} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
@@ -210,6 +212,7 @@ cleanup_old_containers() {
         log_info "Cleaning up host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+                --project=${PROJECT_ID} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
@@ -249,7 +252,7 @@ deploy_all_hosts() {
 
     # First, verify how many workers actually exist
     log_info "Verifying number of TPU workers..."
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
     log_info "TPU has ${ACTUAL_WORKERS} workers"
 
     if [ ${ACTUAL_WORKERS} -lt ${NUM_HOSTS} ]; then
@@ -306,6 +309,7 @@ deploy_single_host() {
     fi
     
     sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+        --project=${PROJECT_ID} \
         --zone=${ZONE} \
         --worker=${host_id} \
         --command="
@@ -377,6 +381,7 @@ monitor_progress() {
     for host_id in {0..7}; do
         echo -e "${CYAN}Host ${host_id}:${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            --project=${PROJECT_ID} \
             --zone=${ZONE} \
             --worker=${host_id} \
             --command="
@@ -392,7 +397,7 @@ monitor_progress() {
     done
     
     log_info "To view detailed logs for a specific host:"
-    log_info "  sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 --command='sudo docker logs -f extraction-host0'"
+    log_info "  sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --worker=0 --command='sudo docker logs -f extraction-host0'"
 
     log_info "To check GCS output:"
     log_info "  sudo gsutil ls -lh gs://${GCS_BUCKET}/${GCS_PREFIX}/"
@@ -411,6 +416,7 @@ view_logs() {
         echo ""
         echo -e "${MAGENTA}========== Host ${host_id} (Last ${lines} lines) ==========${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            --project=${PROJECT_ID} \
             --zone=${ZONE} \
             --worker=${host_id} \
             --command="sudo docker logs --tail ${lines} extraction-host${host_id} 2>&1" 2>/dev/null || true
@@ -430,6 +436,7 @@ stop_all() {
         log_info "Stopping host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+                --project=${PROJECT_ID} \
                 --zone=${ZONE} \
                 --worker=${host_id} \
                 --command="
@@ -458,14 +465,14 @@ check_tpu_info() {
     log_info "Checking TPU: ${TPU_NAME} in zone: ${ZONE}"
 
     # Get TPU details
-    if ! gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+    if ! gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} \
         --format="yaml(acceleratorType,state,networkEndpoints)" 2>&1; then
         log_error "Failed to get TPU information. Check TPU_NAME and ZONE settings."
         return 1
     fi
 
     echo ""
-    ACTUAL_WORKERS=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" 2>/dev/null | wc -l)
+    ACTUAL_WORKERS=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --format="value(networkEndpoints)" 2>/dev/null | wc -l)
     if [ -z "$ACTUAL_WORKERS" ] || [ "$ACTUAL_WORKERS" -eq 0 ]; then
         log_error "Could not determine number of workers"
         return 1
@@ -474,13 +481,13 @@ check_tpu_info() {
 
     echo ""
     log_info "Worker IPs:"
-    gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
+    gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} \
         --format="table(networkEndpoints.ipAddress,networkEndpoints.port)"
 
     echo ""
     log_info "Testing SSH connectivity to each worker..."
     for i in $(seq 0 $((ACTUAL_WORKERS - 1))); do
-        if gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i --command="echo -n 'Worker $i: '; hostname" 2>/dev/null; then
+        if gcloud compute tpus tpu-vm ssh ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --worker=$i --command="echo -n 'Worker $i: '; hostname" 2>/dev/null; then
             log_success "Worker $i: SSH OK"
         else
             log_error "Worker $i: SSH FAILED"
@@ -496,7 +503,7 @@ check_status() {
     log_section "Container Status on All Hosts"
 
     # Get actual number of workers
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 8)
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 8)
     local max_host=$((ACTUAL_WORKERS - 1))
 
     echo ""
@@ -505,6 +512,7 @@ check_status() {
 
     for host_id in $(seq 0 ${max_host}); do
         status=$(sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
+            --project=${PROJECT_ID} \
             --zone=${ZONE} \
             --worker=${host_id} \
             --command="

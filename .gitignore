@@ -1,2 +1,15 @@
 **__pycache__*/
 **/*pkl
+**/*.jsonl
+**/*.jsonl.gz
+**/*.log
+**/*.csv
+**/*.tsv
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.bin
+**/*.h5
+**/*.hdf5
+**/*.zip
+**/*.tar

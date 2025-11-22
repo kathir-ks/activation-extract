@@ -2,7 +2,7 @@
 
 ################################################################################
 # Multi-Host TPU v5e-64 Deployment Script
-# Deploys activation extraction to all 8 hosts in parallel
+# Deploys activation extraction to all 16 hosts in parallel
 #
 # Author: kskathir2003
 # Date: 2025-11-16
@@ -30,7 +30,7 @@ export IMAGE_PATH="${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activati
 # Dataset Configuration
 export DATASET_PATH="gs://fineweb-data-us-central1-a/datasets/arc_barc200k_test_1k.jsonl"
 export GCS_BUCKET="fineweb-data-us-central1-a"
-export GCS_PREFIX="activations_barc200k_8hosts"
+export GCS_PREFIX="activations_barc200k_16hosts"
 
 # Model Configuration
 export MODEL_PATH="KathirKs/qwen-2.5-0.5b"
@@ -39,7 +39,7 @@ export MAX_SEQ_LENGTH=512
 export MAX_TASKS=1000  # Set to empty "" for unlimited
 
 # Multi-Host Configuration
-export NUM_HOSTS=8  # v5e-64 has 8 hosts with 8 chips each = 64 total
+export NUM_HOSTS=16  # v5e-64 has 16 hosts with 4 chips each = 64 total
 export MESH_TYPE="2d"  # Options: 1d, 2d, 3d
 export COORDINATOR_PORT=8476
 
@@ -170,7 +170,7 @@ pull_docker_images() {
 
     local pids=()
 
-    for host_id in {0..7}; do
+    for host_id in {0..15}; do
         log_info "Pulling image on host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -208,7 +208,7 @@ cleanup_old_containers() {
 
     local pids=()
 
-    for host_id in {0..7}; do
+    for host_id in {0..15}; do
         log_info "Cleaning up host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -242,7 +242,7 @@ cleanup_old_containers() {
 ################################################################################
 
 deploy_all_hosts() {
-    log_section "Deploying to All 8 Hosts Simultaneously"
+    log_section "Deploying to All 16 Hosts Simultaneously"
 
     log_info "Starting deployment..."
     log_info "Coordinator: ${COORDINATOR_ADDRESS}"
@@ -260,7 +260,7 @@ deploy_all_hosts() {
         log_warning "Deploying to ${ACTUAL_WORKERS} workers only"
         local max_host=$((ACTUAL_WORKERS - 1))
     else
-        local max_host=7
+        local max_host=15
     fi
 
     local pids=()
@@ -330,8 +330,8 @@ deploy_single_host() {
                 -v ~/.cache/huggingface:/cache/huggingface \
                 ${IMAGE_PATH} \
                 -c \"python /workspace/extract_activations_arc_v5e64.py \
-                    --machine_id 0 \
-                    --total_machines 1 \
+                    --machine_id ${host_id} \
+                    --total_machines ${NUM_HOSTS} \
                     --multihost \
                     --coordinator_address ${COORDINATOR_ADDRESS} \
                     --host_id ${host_id} \
@@ -378,7 +378,7 @@ monitor_progress() {
     log_info "Checking status on all hosts..."
     echo ""
 
-    for host_id in {0..7}; do
+    for host_id in {0..15}; do
         echo -e "${CYAN}Host ${host_id}:${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --project=${PROJECT_ID} \
@@ -412,7 +412,7 @@ view_logs() {
 
     local lines=${1:-50}  # Default 50 lines
 
-    for host_id in {0..7}; do
+    for host_id in {0..15}; do
         echo ""
         echo -e "${MAGENTA}========== Host ${host_id} (Last ${lines} lines) ==========${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -432,7 +432,7 @@ stop_all() {
 
     local pids=()
 
-    for host_id in {0..7}; do
+    for host_id in {0..15}; do
         log_info "Stopping host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -503,7 +503,7 @@ check_status() {
     log_section "Container Status on All Hosts"
 
     # Get actual number of workers
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 8)
+    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --project=${PROJECT_ID} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 16)
     local max_host=$((ACTUAL_WORKERS - 1))
 
     echo ""
@@ -541,7 +541,7 @@ check_status() {
 ################################################################################
 
 main() {
-    log_section "TPU v5e-64 8-Host Parallel Deployment"
+    log_section "TPU v5e-64 16-Host Parallel Deployment"
     echo -e "${CYAN}Date: $(date)${NC}"
     echo -e "${CYAN}User: kskathir2003${NC}"
     echo ""

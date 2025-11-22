@@ -128,13 +128,13 @@ docker push ${IMAGE_PATH}
 
 ## Step 4: Create TPU VMs and Deploy
 
-### For TPU v5e-64 (8 hosts):
+### For TPU v5e-64 (16 hosts):
 
 ```bash
 export ZONE="us-central1-a"
 export TPU_NAME="arc-extraction"
 export BUCKET_NAME="your-bucket-name"
-export NUM_HOSTS=8  # v5e-64 has 8 hosts
+export NUM_HOSTS=16  # v5e-64 has 16 hosts
 
 # Create TPU
 gcloud compute tpus tpu-vm create ${TPU_NAME} \
@@ -151,7 +151,7 @@ COORDINATOR_IP=$(gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 export COORDINATOR_ADDRESS="${COORDINATOR_IP}:8476"
 
 # Deploy to each worker
-for WORKER_ID in {0..7}; do
+for WORKER_ID in {0..15}; do
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
     --zone=${ZONE} \
     --worker=${WORKER_ID} \
@@ -231,7 +231,7 @@ gsutil ls -lh gs://${BUCKET_NAME}/activations/
 
 ```bash
 # Stop containers
-for i in {0..7}; do
+for i in {0..15}; do
   gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i \
     --command="sudo docker stop extraction && sudo docker rm extraction"
 done

@@ -2,7 +2,7 @@
 #
 # Launch activation extraction on TPU v5e-64
 #
-# TPU v5e-64 has 4 hosts, 8 chips per host = 32 total chips
+# TPU v5e-64 has 16 hosts, 4 chips per host = 64 total chips
 # This script should be run on EACH host with appropriate HOST_ID
 #
 
@@ -13,7 +13,7 @@ set -e
 # ============================================================================
 
 # TPU v5e-64 Configuration
-export NUM_HOSTS=4                          # v5e-64 has 4 hosts
+export NUM_HOSTS=16                         # v5e-64 has 16 hosts
 export HOST_ID=${HOST_ID:-0}                # Set via environment or default to 0
 export COORDINATOR_ADDRESS=${COORDINATOR_ADDRESS:-"$(hostname -i):8476"}  # Auto-detect or set manually
 

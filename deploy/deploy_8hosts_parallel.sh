@@ -28,7 +28,7 @@ export IMAGE_TAG="activation-extraction"
 export IMAGE_PATH="${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction"
 
 # Dataset Configuration
-export DATASET_PATH="gs://fineweb-data-us-central1-a/datasets/arc_barc200k_test_1k.jsonl"
+export DATASET_PATH="gs://fineweb-data-us-central1-a/datasets/sharded_16hosts"
 export GCS_BUCKET="fineweb-data-us-central1-a"
 export GCS_PREFIX="activations_barc200k_16hosts"
 

@@ -239,27 +239,16 @@ cleanup_old_containers() {
 ################################################################################
 
 deploy_all_hosts() {
-    log_section "Deploying to All 16 Hosts Simultaneously"
+    log_section "Deploying to All ${NUM_HOSTS} Hosts Simultaneously"
 
     log_info "Starting deployment..."
     log_info "Coordinator: ${COORDINATOR_ADDRESS}"
     log_info "Mesh type: ${MESH_TYPE}"
     log_info "Dataset: ${DATASET_PATH}"
     log_info "Model: ${MODEL_PATH}"
+    log_info "Number of hosts: ${NUM_HOSTS}"
 
-    # First, verify how many workers actually exist
-    log_info "Verifying number of TPU workers..."
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l)
-    log_info "TPU has ${ACTUAL_WORKERS} workers"
-
-    if [ ${ACTUAL_WORKERS} -lt ${NUM_HOSTS} ]; then
-        log_warning "TPU only has ${ACTUAL_WORKERS} workers, but NUM_HOSTS is set to ${NUM_HOSTS}"
-        log_warning "Deploying to ${ACTUAL_WORKERS} workers only"
-        local max_host=$((ACTUAL_WORKERS - 1))
-    else
-        local max_host=15
-    fi
-
+    local max_host=$((NUM_HOSTS - 1))
     local pids=()
 
     # Deploy all hosts simultaneously (including coordinator)
@@ -292,75 +281,75 @@ deploy_all_hosts() {
 
 deploy_single_host() {
     local host_id=$1
-    
+
     # Build max_tasks argument
     local max_tasks_arg=""
     if [ -n "${MAX_TASKS}" ]; then
         max_tasks_arg="--max_tasks ${MAX_TASKS}"
     fi
-    
+
     # Build layers argument
     local layers_arg=""
     if [ -n "${LAYERS_TO_EXTRACT}" ]; then
         layers_arg="--layers_to_extract ${LAYERS_TO_EXTRACT}"
     fi
-    
+
     sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
         --zone=${ZONE} \
         --worker=${host_id} \
         --command="
-            echo '========================================================================'
-            echo 'Host ${host_id}: Starting extraction container'
-            echo '========================================================================'
+echo ========================================================================
+echo Host ${host_id}: Starting extraction container
+echo ========================================================================
 
-            # Create data directory
-            mkdir -p ~/data/output
+# Create data directory
+mkdir -p ~/data/output
 
-            # Run Docker container
-            sudo docker run -d \
-                --name extraction-host${host_id} \
-                --net=host \
-                --privileged \
-                -v ~/data:/workspace/data \
-                -v ~/.config/gcloud:/root/.config/gcloud:ro \
-                -v ~/.cache/huggingface:/cache/huggingface \
-                ${IMAGE_PATH} \
-                -c \"python /workspace/extract_activations_arc_v5e64.py \
-                    --machine_id ${host_id} \
-                    --total_machines ${NUM_HOSTS} \
-                    --multihost \
-                    --coordinator_address ${COORDINATOR_ADDRESS} \
-                    --host_id ${host_id} \
-                    --num_hosts ${NUM_HOSTS} \
-                    --mesh_type ${MESH_TYPE} \
-                    --model_path ${MODEL_PATH} \
-                    --dataset_path ${DATASET_PATH} \
-                    --batch_size ${BATCH_SIZE} \
-                    --max_seq_length ${MAX_SEQ_LENGTH} \
-                    ${max_tasks_arg} \
-                    ${layers_arg} \
-                    --output_dir /workspace/data/output \
-                    --upload_to_gcs \
-                    --gcs_bucket ${GCS_BUCKET} \
-                    --gcs_prefix ${GCS_PREFIX}/host_${host_id} \
-                    --shard_size_gb ${SHARD_SIZE_GB} \
-                    ${COMPRESS_SHARDS} \
-                    ${DELETE_LOCAL} \
-                    ${VERBOSE}\"
+# Run Docker container
+sudo docker run -d \
+    --name extraction-host${host_id} \
+    --net=host \
+    --privileged \
+    -v ~/data:/workspace/data \
+    -v ~/.config/gcloud:/root/.config/gcloud:ro \
+    -v ~/.cache/huggingface:/cache/huggingface \
+    ${IMAGE_PATH} \
+    -c 'python /workspace/extract_activations_arc_v5e64.py \
+        --machine_id ${host_id} \
+        --total_machines ${NUM_HOSTS} \
+        --multihost \
+        --coordinator_address ${COORDINATOR_ADDRESS} \
+        --host_id ${host_id} \
+        --num_hosts ${NUM_HOSTS} \
+        --mesh_type ${MESH_TYPE} \
+        --model_path ${MODEL_PATH} \
+        --dataset_path ${DATASET_PATH} \
+        --batch_size ${BATCH_SIZE} \
+        --max_seq_length ${MAX_SEQ_LENGTH} \
+        ${max_tasks_arg} \
+        ${layers_arg} \
+        --output_dir /workspace/data/output \
+        --upload_to_gcs \
+        --gcs_bucket ${GCS_BUCKET} \
+        --gcs_prefix ${GCS_PREFIX}/host_${host_id} \
+        --shard_size_gb ${SHARD_SIZE_GB} \
+        ${COMPRESS_SHARDS} \
+        ${DELETE_LOCAL} \
+        ${VERBOSE}'
 
-            echo 'Host ${host_id}: Container started'
+echo Host ${host_id}: Container started
 
-            # Wait a moment and check if container is running
-            sleep 5
-            if sudo docker ps | grep -q extraction-host${host_id}; then
-                echo 'Host ${host_id}: ✓ Container running successfully'
-            else
-                echo 'Host ${host_id}: ✗ Container failed to start'
-                sudo docker logs extraction-host${host_id}
-                exit 1
-            fi
-        " 2>&1 | sed "s/^/[Host ${host_id}] /"
-    
+# Wait a moment and check if container is running
+sleep 5
+if sudo docker ps | grep -q extraction-host${host_id}; then
+    echo Host ${host_id}: Container running successfully
+else
+    echo Host ${host_id}: Container failed to start
+    sudo docker logs extraction-host${host_id}
+    exit 1
+fi
+" 2>&1 | sed "s/^/[Host ${host_id}] /"
+
     return $?
 }
 
@@ -456,30 +445,15 @@ check_tpu_info() {
     log_section "TPU Configuration"
 
     log_info "Checking TPU: ${TPU_NAME} in zone: ${ZONE}"
+    log_info "Configured NUM_HOSTS: ${NUM_HOSTS}"
 
-    # Get TPU details
-    if ! gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
-        --format="yaml(acceleratorType,state,networkEndpoints)" 2>&1; then
-        log_error "Failed to get TPU information. Check TPU_NAME and ZONE settings."
-        return 1
-    fi
-
-    echo ""
-    ACTUAL_WORKERS=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" 2>/dev/null | wc -l)
-    if [ -z "$ACTUAL_WORKERS" ] || [ "$ACTUAL_WORKERS" -eq 0 ]; then
-        log_error "Could not determine number of workers"
-        return 1
-    fi
-    log_info "Total workers: ${ACTUAL_WORKERS}"
-
-    echo ""
-    log_info "Worker IPs:"
+    # Get TPU details (optional - may fail if gcloud can't query)
     gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} \
-        --format="table(networkEndpoints.ipAddress,networkEndpoints.port)"
+        --format="yaml(acceleratorType,state,networkEndpoints)" 2>&1 || true
 
     echo ""
-    log_info "Testing SSH connectivity to each worker..."
-    for i in $(seq 0 $((ACTUAL_WORKERS - 1))); do
+    log_info "Testing SSH connectivity to ${NUM_HOSTS} workers..."
+    for i in $(seq 0 $((NUM_HOSTS - 1))); do
         if gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i --command="echo -n 'Worker $i: '; hostname" 2>/dev/null; then
             log_success "Worker $i: SSH OK"
         else
@@ -495,9 +469,7 @@ check_tpu_info() {
 check_status() {
     log_section "Container Status on All Hosts"
 
-    # Get actual number of workers
-    ACTUAL_WORKERS=$(sudo gcloud compute tpus tpu-vm describe ${TPU_NAME} --zone=${ZONE} --format="value(networkEndpoints)" | wc -l 2>/dev/null || echo 16)
-    local max_host=$((ACTUAL_WORKERS - 1))
+    local max_host=$((NUM_HOSTS - 1))
 
     echo ""
     printf "%-8s %-15s %-20s %-15s\n" "Host" "Status" "Container ID" "Uptime"

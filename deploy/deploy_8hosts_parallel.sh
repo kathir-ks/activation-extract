@@ -169,7 +169,7 @@ pull_docker_images() {
 
     local pids=()
 
-    for host_id in {0..15}; do
+    for host_id in $(seq 0 $((NUM_HOSTS - 1))); do
         log_info "Pulling image on host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -206,7 +206,7 @@ cleanup_old_containers() {
 
     local pids=()
 
-    for host_id in {0..15}; do
+    for host_id in $(seq 0 $((NUM_HOSTS - 1))); do
         log_info "Cleaning up host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -363,7 +363,7 @@ monitor_progress() {
     log_info "Checking status on all hosts..."
     echo ""
 
-    for host_id in {0..15}; do
+    for host_id in $(seq 0 $((NUM_HOSTS - 1))); do
         echo -e "${CYAN}Host ${host_id}:${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
             --zone=${ZONE} \
@@ -396,7 +396,7 @@ view_logs() {
 
     local lines=${1:-50}  # Default 50 lines
 
-    for host_id in {0..15}; do
+    for host_id in $(seq 0 $((NUM_HOSTS - 1))); do
         echo ""
         echo -e "${MAGENTA}========== Host ${host_id} (Last ${lines} lines) ==========${NC}"
         sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
@@ -415,7 +415,7 @@ stop_all() {
 
     local pids=()
 
-    for host_id in {0..15}; do
+    for host_id in $(seq 0 $((NUM_HOSTS - 1))); do
         log_info "Stopping host ${host_id}..."
         (
             sudo gcloud compute tpus tpu-vm ssh ${TPU_NAME} \

@@ -3,6 +3,10 @@ Convert HuggingFace dataset to ARC-AGI format for activation extraction
 
 This script converts datasets like barc0/200k_HEAVY to ARC format
 WITHOUT slicing training examples (keeps all pairs for richer context)
+
+NOTE: This script outputs raw train/test grids only. Prompts are generated
+dynamically by extract_activations_arc_v5e64.py using the arc24 pipeline,
+which also applies data augmentation before prompting.
 """
 
 import json

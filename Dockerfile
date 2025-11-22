@@ -3,6 +3,36 @@
 # This Docker image contains all dependencies for running activation
 # extraction on Google Cloud TPU v5e-64
 #
+# =============================================================================
+# BUILD AND PUSH TO ARTIFACT REGISTRY
+# =============================================================================
+#
+# 1. Set your project and region variables:
+#    export PROJECT_ID="absolute-axis-470415-g6"
+#    export AR_REGION="us-central1"
+#    export AR_REPO="arc-agi-us-central1"
+#
+# 2. Create Artifact Registry repository (if not exists):
+#    gcloud artifacts repositories create ${AR_REPO} \
+#      --repository-format=docker \
+#      --location=${AR_REGION} \
+#      --project=${PROJECT_ID} \
+#      --description="Docker repository for ARC-AGI activation extraction"
+#
+# 3. Configure Docker authentication for Artifact Registry:
+#    gcloud auth configure-docker ${AR_REGION}-docker.pkg.dev
+#
+# 4. Build the image:
+#    docker build -t ${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction .
+#
+# 5. Push to Artifact Registry:
+#    docker push ${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/activation-extraction
+#
+# NOTE: Do NOT use gcr.io (Google Container Registry) as it is deprecated.
+#       Always use Artifact Registry: ${AR_REGION}-docker.pkg.dev/...
+#
+# =============================================================================
+#
 
 FROM python:3.11-slim
 

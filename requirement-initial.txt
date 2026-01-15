@@ -1,0 +1,29 @@
+-> Need to load the model from Huggingface  KathirKs/qwen-2.5-0.5b, 
+convert it to jax weights, perform the forward pass. 
+-> Perform the forward pass with the ARC-AGI input pipeline 
+and extract the model activations at different layers so that we 
+can train auto encoders for this 
+-> One very crucial factor is to consider the bit format between the 
+native model and the model that we conevrt into jax weights, 
+the activations, and the SAE that we train. 
+
+
+Currently, single host execution is the primary goal. 
+Like v4=8, v5e-8 and v6e tpus. 
+
+We need to use the dataset from barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems
+to be loaded, and converted to the required format. 
+
+
+
+What I want now is I want the single host extraction to work fine. We can 
+extract for all the layers in the model. 
+
+I want this data pipeline. Where I will have the pre-emptible tpus running, 
+where they receive the data (input from barc0/200k_heavy...), where the data
+is already split up between the host - which is a predefined numbe, such as 
+32 or 64. So we split that data into that much streams. And the hosts will 
+load data from its own stream. Here the number mapping would be between 
+the tpu number and the steam number. Then these activations should 
+be uploaded to the gcs periodically. Where it is stored in 
+a nested file dir, where each tpu number will have a folder. 

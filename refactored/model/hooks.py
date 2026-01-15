@@ -1,13 +1,17 @@
 """
-Qwen 2.5 Model with Layer Activation Extraction Hooks
-Fully compatible with KV caching and RoPE caching from qwen2_jax.py
+Qwen Model with Activation Extraction Hooks
+
+Provides model variants that can capture intermediate activations
+during forward passes, useful for:
+- SAE (Sparse Autoencoder) training
+- Interpretability research
+- Activation analysis
 
 Key Features:
-- Supports KV cache for fast generation (8-10x speedup)
-- RoPE cache pre-computed in model setup
-- Optional activation extraction from intermediate layers
+- Supports KV cache for fast generation
+- Optional activation extraction from specific layers
+- Configurable activation types (mlp, attn, residual)
 - JIT-compatible with proper static argument handling
-- Can extract activations during both prefill and decode phases
 """
 
 import jax
@@ -15,17 +19,24 @@ import jax.numpy as jnp
 from jax import lax
 import flax.linen as nn
 from typing import Optional, Tuple, Dict, Any, List
-from dataclasses import dataclass
 import time
 
-from qwen2_jax import (
-    QwenConfig, RMSNorm, QwenMLP, QwenAttention,
-    rotate_half, apply_rotary_pos_emb, convert_hf_to_jax_weights
-)
+from .config import QwenConfig
+from .qwen import RMSNorm, QwenMLP, QwenAttention
 
 
 class QwenDecoderLayerWithHooks(nn.Module):
-    """Qwen decoder layer with optional activation capture"""
+    """
+    Qwen decoder layer with optional activation capture.
+    
+    Can return intermediate activations at various points:
+    - attn: Attention output before residual
+    - mlp: MLP output before residual
+    - residual: Final output after both residuals
+    
+    Attributes:
+        config: Model configuration
+    """
     config: QwenConfig
 
     @nn.compact
@@ -76,11 +87,11 @@ class QwenDecoderLayerWithHooks(nn.Module):
         # Return based on what's requested
         if return_activations:
             activations = {
-                'attn': attn_activation,  # Attention output before residual
-                'mlp': mlp_activation,    # MLP output before residual
-                'residual': layer_output_activation,  # Final output after both residuals
-                'post_attn': post_attn_activation,  # For backward compatibility
-                'layer_output': layer_output_activation  # For backward compatibility
+                'attn': attn_activation,
+                'mlp': mlp_activation,
+                'residual': layer_output_activation,
+                'post_attn': post_attn_activation,
+                'layer_output': layer_output_activation
             }
             return hidden_states, new_kv_cache, activations
         else:
@@ -89,30 +100,41 @@ class QwenDecoderLayerWithHooks(nn.Module):
 
 class QwenModelWithActivations(nn.Module):
     """
-    Qwen model that supports both KV caching and activation extraction
-
-    This model can operate in three modes:
+    Qwen model that supports both KV caching and activation extraction.
+    
+    Operating modes:
     1. Fast inference (return_activations=False, with KV cache)
     2. Normal inference (return_activations=False, without KV cache)
-    3. Activation extraction (return_activations=True, with or without KV cache)
-
-    Returns:
-        When return_activations=False:
-            - logits: [batch, seq_len, vocab_size]
-            - new_kv_caches: List of per-layer (k, v) tuples
-
-        When return_activations=True:
-            - logits: [batch, seq_len, vocab_size]
-            - new_kv_caches: List of per-layer (k, v) tuples
-            - activations: Dict mapping 'layer_{i}' -> layer hidden states
+    3. Activation extraction (return_activations=True)
+    
+    Attributes:
+        config: Model configuration
+        layers_to_extract: Tuple of layer indices to extract (None = all)
+        activation_type: Type of activation ('mlp', 'attn', or 'residual')
     """
     config: QwenConfig
-    layers_to_extract: Optional[Tuple[int, ...]] = None  # Tuple for static arg compatibility
-    activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
+    layers_to_extract: Optional[Tuple[int, ...]] = None
+    activation_type: str = 'residual'
 
     @nn.compact
     def __call__(self, input_ids, attention_mask=None, kv_caches=None,
                  position_offset=0, return_activations=False):
+        """
+        Forward pass with optional activation extraction.
+        
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            attention_mask: Optional attention mask
+            kv_caches: Optional list of (k, v) tuples
+            position_offset: Position offset for generation
+            return_activations: Whether to return layer activations
+            
+        Returns:
+            When return_activations=False:
+                logits, new_kv_caches
+            When return_activations=True:
+                logits, new_kv_caches, activations
+        """
         batch_size, seq_len = input_ids.shape
 
         # Token embeddings
@@ -127,10 +149,8 @@ class QwenModelWithActivations(nn.Module):
         # Create causal mask if not provided
         if attention_mask is None:
             if kv_caches is not None:
-                # Decode phase: no masking needed (attend to all cached tokens)
                 attention_mask = None
             else:
-                # Prefill phase: use causal mask
                 attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
                 attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
                 attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
@@ -156,18 +176,13 @@ class QwenModelWithActivations(nn.Module):
 
             # Store layer activation if extracted
             if extract_this_layer and layer_activations is not None:
-                # Select activation based on activation_type configuration
                 if self.activation_type == 'mlp':
-                    # MLP output before residual
                     activations[f'layer_{i}'] = layer_activations['mlp']
                 elif self.activation_type == 'attn':
-                    # Attention output before residual
                     activations[f'layer_{i}'] = layer_activations['attn']
                 elif self.activation_type == 'residual':
-                    # Final output after both residuals (default)
                     activations[f'layer_{i}'] = layer_activations['residual']
                 else:
-                    # Fallback to residual for backward compatibility
                     activations[f'layer_{i}'] = layer_activations.get('residual', layer_activations['layer_output'])
 
         # Final norm
@@ -200,31 +215,37 @@ class QwenModelWithActivations(nn.Module):
             return lm_logits, new_kv_caches
 
 
-def create_model_with_hooks(config: QwenConfig, layers_to_extract: Optional[List[int]] = None,
-                            activation_type: str = 'residual'):
+def create_model_with_hooks(
+    config: QwenConfig, 
+    layers_to_extract: Optional[List[int]] = None,
+    activation_type: str = 'residual'
+) -> QwenModelWithActivations:
     """
-    Create a Qwen model with activation extraction hooks
-
+    Create a Qwen model with activation extraction hooks.
+    
     Args:
         config: Model configuration
         layers_to_extract: List of layer indices to extract (None = all layers)
-        activation_type: Type of activation to extract. One of:
+        activation_type: Type of activation to extract:
             - 'mlp': MLP output before residual connection
             - 'attn': Attention output before residual connection
-            - 'residual': Final layer output after both residual connections (default)
-
+            - 'residual': Final layer output after both residuals (default)
+            
     Returns:
         QwenModelWithActivations instance
-
-    Note: layers_to_extract is converted to tuple for JIT compatibility
+        
+    Note:
+        layers_to_extract is converted to tuple for JIT compatibility
     """
-    # Validate activation_type
     if activation_type not in ['mlp', 'attn', 'residual']:
         raise ValueError(f"activation_type must be 'mlp', 'attn', or 'residual', got: {activation_type}")
     
-    # Convert list to tuple for JIT static argument compatibility
     layers_tuple = tuple(layers_to_extract) if layers_to_extract is not None else None
-    return QwenModelWithActivations(config=config, layers_to_extract=layers_tuple, activation_type=activation_type)
+    return QwenModelWithActivations(
+        config=config, 
+        layers_to_extract=layers_tuple, 
+        activation_type=activation_type
+    )
 
 
 def generate_with_kv_cache_and_activations(
@@ -235,32 +256,30 @@ def generate_with_kv_cache_and_activations(
     extract_activations: bool = False,
     extract_every_n_tokens: int = 1,
     tokenizer=None
-):
+) -> Tuple[jnp.ndarray, Optional[List[Dict]], Dict]:
     """
-    Efficient generation with KV caching and optional activation extraction
-
-    This function implements the prefill/decode pattern from qwen2_jax.py
-    while adding support for activation extraction.
-
+    Efficient generation with KV caching and optional activation extraction.
+    
+    Implements the prefill/decode pattern for fast autoregressive generation
+    while supporting activation extraction at configurable intervals.
+    
     Args:
         model: QwenModelWithActivations instance
         params: Model parameters
         input_ids: Input token IDs [batch, seq_len]
         max_tokens: Maximum tokens to generate
         extract_activations: Whether to extract activations
-        extract_every_n_tokens: Extract activations every N tokens (for efficiency)
+        extract_every_n_tokens: Extract activations every N tokens
         tokenizer: Optional tokenizer for EOS detection
-
+        
     Returns:
         generated_ids: Generated token IDs [batch, seq_len + max_tokens]
         activations_per_step: List of activation dicts (if extract_activations=True)
         timing_info: Dict with prefill/decode timing
     """
-
     # JIT compile functions for performance
     @jax.jit
     def prefill(params, input_ids):
-        """Prefill: Process entire prompt once"""
         return model.apply(
             params, input_ids,
             kv_caches=None,
@@ -270,7 +289,6 @@ def generate_with_kv_cache_and_activations(
 
     @jax.jit
     def decode_step(params, input_id, kv_caches, position):
-        """Decode: Process one token with KV cache"""
         return model.apply(
             params, input_id,
             kv_caches=kv_caches,
@@ -278,9 +296,7 @@ def generate_with_kv_cache_and_activations(
             return_activations=False
         )
 
-    # For activation extraction, we use a non-JIT version
     def decode_step_with_activations(params, input_id, kv_caches, position):
-        """Decode with activation extraction (slower but captures activations)"""
         return model.apply(
             params, input_id,
             kv_caches=kv_caches,
@@ -291,7 +307,7 @@ def generate_with_kv_cache_and_activations(
     timing_info = {}
     start_time = time.time()
 
-    # Prefill phase: process the entire prompt
+    # Prefill phase
     logits, kv_caches = prefill(params, input_ids)
     next_token_logits = logits[:, -1, :]
     next_token_id = jnp.argmax(next_token_logits, axis=-1, keepdims=True)
@@ -300,17 +316,15 @@ def generate_with_kv_cache_and_activations(
     prefill_time = time.time() - start_time
     timing_info['prefill_time'] = prefill_time
 
-    # Decode phase: generate tokens one at a time
+    # Decode phase
     activations_per_step = [] if extract_activations else None
     decode_start = time.time()
     tokens_generated = 1
 
     for i in range(1, max_tokens):
-        # Decide whether to extract activations for this step
         should_extract = extract_activations and (i % extract_every_n_tokens == 0)
 
         if should_extract:
-            # Use slower path with activation extraction
             logits, kv_caches, activations = decode_step_with_activations(
                 params, next_token_id, kv_caches, input_ids.shape[1] + i - 1
             )
@@ -320,7 +334,6 @@ def generate_with_kv_cache_and_activations(
                 'activations': activations
             })
         else:
-            # Use fast path without activation extraction
             logits, kv_caches = decode_step(
                 params, next_token_id, kv_caches, input_ids.shape[1] + i - 1
             )
@@ -330,7 +343,6 @@ def generate_with_kv_cache_and_activations(
         generated_ids = jnp.concatenate([generated_ids, next_token_id], axis=1)
         tokens_generated += 1
 
-        # Check for EOS token
         if tokenizer and tokenizer.eos_token_id and next_token_id[0, 0] == tokenizer.eos_token_id:
             break
 
@@ -348,21 +360,21 @@ def extract_activations_from_prompt(
     params,
     input_ids,
     layers_to_extract: Optional[List[int]] = None
-):
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    Extract activations from a prompt (single forward pass, no generation)
-
-    This is useful for extracting activations from existing text without generation.
-
+    Extract activations from a prompt (single forward pass, no generation).
+    
+    Useful for extracting activations from existing text.
+    
     Args:
         model: QwenModelWithActivations instance
         params: Model parameters
         input_ids: Input token IDs [batch, seq_len]
         layers_to_extract: Which layers to extract (None = all)
-
+        
     Returns:
         logits: Model logits [batch, seq_len, vocab_size]
-        activations: Dict mapping 'layer_{i}' -> hidden states [batch, seq_len, hidden_dim]
+        activations: Dict mapping 'layer_{i}' -> hidden states
     """
     logits, _, activations = model.apply(
         params, input_ids,
@@ -379,13 +391,13 @@ def extract_specific_token_activations(
     token_positions: Optional[List[int]] = None
 ) -> Dict[str, jnp.ndarray]:
     """
-    Extract activations from specific layers and token positions
-
+    Extract activations from specific layers and token positions.
+    
     Args:
         activations: Dict from 'layer_{i}' -> hidden_states [batch, seq_len, hidden_dim]
         layer_indices: Which layers to extract (None = all)
-        token_positions: Which token positions to extract (None = all, -1 = last token)
-
+        token_positions: Which token positions to extract (None = all, [-1] = last token)
+        
     Returns:
         Filtered activations dict
     """
@@ -399,92 +411,20 @@ def extract_specific_token_activations(
                 if layer_indices is not None and layer_idx not in layer_indices:
                     continue
             except (ValueError, IndexError):
-                # Skip non-numeric layer names like 'final_norm'
                 if layer_indices is not None:
                     continue
 
         # Filter by token position
         if token_positions is not None:
             if token_positions == [-1]:
-                # Last token only
                 filtered[layer_name] = acts[:, -1:, :]
             else:
-                # Specific positions
                 filtered[layer_name] = acts[:, token_positions, :]
         else:
-            # All positions
             filtered[layer_name] = acts
 
     return filtered
 
 
-# Example usage and defaults
-DEFAULT_SAE_LAYERS = list(range(10, 24))  # Layers 10-23 for SAE training
-
-
-if __name__ == "__main__":
-    # Example: Create model with hooks for specific layers
-    print("Testing QwenModelWithActivations...")
-
-    config = QwenConfig()
-
-    # Test 1: Model with specific layers
-    print("\n=== Test 1: Model with specific layer extraction ===")
-    model = create_model_with_hooks(config, layers_to_extract=[6, 12, 18, 23])
-
-    # Initialize parameters
-    key = jax.random.PRNGKey(0)
-    dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
-    variables = model.init(key, dummy_input)
-
-    # Test forward pass with activation extraction
-    print("Testing forward pass with activations...")
-    logits, kv_caches, activations = model.apply(
-        variables, dummy_input, return_activations=True
-    )
-
-    print(f"Logits shape: {logits.shape}")
-    print(f"Number of KV caches: {len(kv_caches)}")
-    print(f"Extracted layers: {list(activations.keys())}")
-    for layer_name, acts in activations.items():
-        print(f"  {layer_name}: {acts.shape}")
-
-    # Test 2: Fast inference without activations
-    print("\n=== Test 2: Fast inference with KV cache (no activations) ===")
-
-    # Prefill
-    logits, kv_caches = model.apply(
-        variables, dummy_input,
-        kv_caches=None,
-        position_offset=0,
-        return_activations=False
-    )
-    print(f"Prefill - Logits: {logits.shape}, KV caches created: {len(kv_caches)}")
-
-    # Decode step
-    next_token = jnp.array([[42]], dtype=jnp.int32)
-    logits, new_kv_caches = model.apply(
-        variables, next_token,
-        kv_caches=kv_caches,
-        position_offset=10,
-        return_activations=False
-    )
-    print(f"Decode - Logits: {logits.shape}, KV caches updated: {len(new_kv_caches)}")
-
-    # Test 3: Generation with activation extraction
-    print("\n=== Test 3: Generation with KV cache and activation extraction ===")
-    generated_ids, activations_per_step, timing = generate_with_kv_cache_and_activations(
-        model=model,
-        params=variables,
-        input_ids=dummy_input,
-        max_tokens=10,
-        extract_activations=True,
-        extract_every_n_tokens=2  # Extract every 2 tokens for efficiency
-    )
-
-    print(f"Generated shape: {generated_ids.shape}")
-    print(f"Activations extracted at {len(activations_per_step)} steps")
-    print(f"Timing: prefill={timing['prefill_time']:.3f}s, decode={timing['decode_time']:.3f}s")
-    print(f"Tokens/sec: {timing['tokens_per_sec']:.2f}")
-
-    print("\n=== All tests passed! ===")
+# Default layers for SAE training (later layers typically more interesting)
+DEFAULT_SAE_LAYERS = list(range(10, 24))

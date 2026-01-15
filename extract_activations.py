@@ -3,11 +3,20 @@
 Activation Extraction for ARC Dataset on TPU
 
 Refactored version using shared core utilities.
+Supports parallel independent single-host workers with checkpoint/resume.
 
 This script extracts activations from ARC-format datasets (JSONL) and is optimized
 for single or multi-host TPU processing.
 
 Usage:
+    # Parallel Independent Workers (Recommended for pre-emptible TPUs)
+    export TPU_WORKER_ID=5
+    python extract_activations.py \
+        --dataset_path data/stream_${TPU_WORKER_ID}.jsonl \
+        --model_path Qwen/Qwen2.5-0.5B \
+        --gcs_bucket your-bucket \
+        --upload_to_gcs
+
     # Single JSONL file
     python extract_activations.py \
         --dataset_path dataset.jsonl \
@@ -69,10 +78,41 @@ from arc24.data_augmentation import set_random_seed
 from arc24.encoders import create_grid_encoder
 
 
+def load_checkpoint(checkpoint_path: str) -> Dict:
+    """Load checkpoint file if exists"""
+    if os.path.exists(checkpoint_path):
+        try:
+            with open(checkpoint_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load checkpoint {checkpoint_path}: {e}")
+    return {}
+
+
+def save_checkpoint(checkpoint_path: str, data: Dict):
+    """Save checkpoint file"""
+    try:
+        os.makedirs(os.path.dirname(checkpoint_path) if os.path.dirname(checkpoint_path) else '.', exist_ok=True)
+        with open(checkpoint_path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save checkpoint {checkpoint_path}: {e}")
+
+
+def get_worker_id() -> int:
+    """Get worker ID from environment variable or default to 0"""
+    return int(os.environ.get('TPU_WORKER_ID', os.environ.get('WORKER_ID', '0')))
+
+
 @dataclass
 class ExtractionConfig:
     """Configuration for activation extraction"""
-    # Distributed config
+    # Worker config (for parallel independent workers)
+    worker_id: Optional[int] = None  # Auto-detected from env if None
+    enable_checkpointing: bool = True
+    checkpoint_dir: str = './checkpoints'
+
+    # Distributed config (legacy multi-host mode)
     machine_id: int = 0
     total_machines: int = 1
 
@@ -121,6 +161,10 @@ class ExtractionConfig:
     verbose: bool = True
 
     def __post_init__(self):
+        # Auto-detect worker_id from environment if not set
+        if self.worker_id is None:
+            self.worker_id = get_worker_id()
+
         # Validate configuration
         if self.use_sharded_dataset and not self.sharded_dataset_dir:
             raise ValueError("--sharded_dataset_dir required when using --use_sharded_dataset")
@@ -129,9 +173,12 @@ class ExtractionConfig:
         if self.upload_to_gcs and not self.gcs_bucket:
             raise ValueError("--gcs_bucket required when --upload_to_gcs is set")
 
-        # Update GCS prefix with machine/host info if needed
+        # Update GCS prefix to include per-TPU folder (tpu_X/)
         if self.upload_to_gcs:
             prefix = self.gcs_prefix
+            # Add worker folder for parallel independent workers
+            prefix = f"{prefix}/tpu_{self.worker_id}"
+            # Legacy: add machine/host info for old multi-host mode
             if self.total_machines > 1:
                 prefix += f"_machine_{self.machine_id:02d}"
             if self.multihost:
@@ -191,7 +238,13 @@ def process_batch(
 def main():
     parser = argparse.ArgumentParser(description="Extract activations from ARC dataset")
 
-    # Distributed args
+    # Worker args (for parallel independent workers)
+    parser.add_argument('--worker_id', type=int, help="Worker ID (auto-detected from TPU_WORKER_ID env if not set)")
+    parser.add_argument('--enable_checkpointing', action='store_true', default=True, help="Enable checkpoint/resume")
+    parser.add_argument('--no_checkpointing', action='store_false', dest='enable_checkpointing', help="Disable checkpointing")
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help="Checkpoint directory")
+
+    # Distributed args (legacy multi-host mode)
     parser.add_argument('--machine_id', type=int, default=0)
     parser.add_argument('--total_machines', type=int, default=1)
 
@@ -250,12 +303,31 @@ def main():
     jax.config.update('jax_log_compiles', True)
 
     print("="*70)
-    print(f"ACTIVATION EXTRACTION - MACHINE {cfg.machine_id}")
+    print(f"ACTIVATION EXTRACTION - WORKER {cfg.worker_id}")
     if cfg.multihost:
         print(f"MULTI-HOST MODE - Host {cfg.host_id}/{cfg.num_hosts-1}")
     print("="*70)
     print(json.dumps(asdict(cfg), indent=2))
     print("="*70)
+
+    # Load checkpoint if enabled
+    checkpoint_path = os.path.join(cfg.checkpoint_dir, f"checkpoint_worker_{cfg.worker_id}.json")
+    checkpoint = {}
+    start_sample_idx = 0
+
+    if cfg.enable_checkpointing:
+        checkpoint = load_checkpoint(checkpoint_path)
+        if checkpoint:
+            start_sample_idx = checkpoint.get('last_processed_sample_idx', 0) + 1
+            print(f"\n{'='*70}")
+            print(f"📌 RESUMING FROM CHECKPOINT")
+            print(f"{'='*70}")
+            print(f"  Last processed sample: {checkpoint.get('last_processed_sample_idx', 0)}")
+            print(f"  Starting from sample: {start_sample_idx}")
+            print(f"  Total shards saved: {checkpoint.get('total_shards', 0)}")
+            print(f"{'='*70}\n")
+        else:
+            print(f"\n✓ No checkpoint found, starting fresh from sample 0\n")
 
     # Initialize multi-host if needed
     if cfg.multihost:
@@ -378,7 +450,12 @@ def main():
 
     # Process batches
     print(f"\nExtracting activations...")
+    print(f"  Total samples: {len(sequences)}")
+    print(f"  Starting from sample: {start_sample_idx}")
+    print(f"  Batch size: {cfg.batch_size}")
+
     num_batches = (len(sequences) + cfg.batch_size - 1) // cfg.batch_size
+    last_saved_shard_count = checkpoint.get('total_shards', 0)
 
     context = mesh if mesh is not None else open(os.devnull)
     with context:
@@ -386,8 +463,19 @@ def main():
             start_idx = batch_idx * cfg.batch_size
             end_idx = min(start_idx + cfg.batch_size, len(sequences))
 
-            batch_sequences = sequences[start_idx:end_idx]
-            batch_sample_indices = list(range(start_idx, end_idx))
+            # Skip if all samples in this batch have been processed
+            if end_idx <= start_sample_idx:
+                continue
+
+            # Skip already processed samples within the batch
+            if start_idx < start_sample_idx:
+                # Partial batch: some samples already processed
+                batch_sequences = sequences[start_sample_idx:end_idx]
+                batch_sample_indices = list(range(start_sample_idx, end_idx))
+            else:
+                # Full batch: no samples processed yet
+                batch_sequences = sequences[start_idx:end_idx]
+                batch_sample_indices = list(range(start_idx, end_idx))
 
             process_batch(
                 jax_model, params, batch_sequences, batch_sample_indices,
@@ -396,8 +484,38 @@ def main():
                 cfg.batch_size, cfg.max_seq_length
             )
 
+            # Save checkpoint if new shard was created (detected by increase in shard count)
+            if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
+                checkpoint_data = {
+                    'worker_id': cfg.worker_id,
+                    'last_processed_sample_idx': end_idx - 1,
+                    'total_samples_processed': end_idx,
+                    'total_shards': storage.shard_count,
+                    'dataset_path': cfg.dataset_path,
+                    'model_path': cfg.model_path,
+                }
+                save_checkpoint(checkpoint_path, checkpoint_data)
+                last_saved_shard_count = storage.shard_count
+                if cfg.verbose:
+                    print(f"\n  💾 Checkpoint saved: sample {end_idx - 1}, {storage.shard_count} shards")
+
     # Finalize
     storage.finalize()
+
+    # Save final checkpoint
+    if cfg.enable_checkpointing:
+        final_checkpoint = {
+            'worker_id': cfg.worker_id,
+            'last_processed_sample_idx': len(sequences) - 1,
+            'total_samples_processed': len(sequences),
+            'total_shards': storage.shard_count,
+            'dataset_path': cfg.dataset_path,
+            'model_path': cfg.model_path,
+            'status': 'completed'
+        }
+        save_checkpoint(checkpoint_path, final_checkpoint)
+        if cfg.verbose:
+            print(f"\n💾 Final checkpoint saved")
 
     # Mark shard as completed if using sharded dataset
     if shard_manager is not None and claimed_shard_id is not None:
@@ -406,9 +524,12 @@ def main():
         shard_manager.mark_completed(claimed_shard_id)
 
     print("\n" + "="*70)
-    print(f"EXTRACTION COMPLETE!")
+    print(f"✅ EXTRACTION COMPLETE - WORKER {cfg.worker_id}")
+    print("="*70)
     if claimed_shard_id is not None:
         print(f"  Shard processed: {claimed_shard_id}")
+    print(f"  Total samples processed: {len(sequences)}")
+    print(f"  Total shards created: {storage.shard_count}")
     print(f"  Activations saved to: {cfg.output_dir}")
     if cfg.upload_to_gcs:
         print(f"  GCS path: gs://{cfg.gcs_bucket}/{cfg.gcs_prefix}/")

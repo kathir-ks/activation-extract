@@ -1,100 +1,0 @@
-/usr/lib/python3/dist-packages/pytz/__init__.py:31: SyntaxWarning: invalid escape sequence '\s'
-  match = re.match("^#\s*version\s*([0-9a-z]*)\s*$", line)
-======================================================================
-FINEWEB-EDU ACTIVATION EXTRACTION - MACHINE 0/0
-======================================================================
-{
-  "machine_id": 0,
-  "total_machines": 1,
-  "model_path": "Qwen/Qwen2.5-7B",
-  "dataset_name": "HuggingFaceFW/fineweb-edu",
-  "dataset_config": "sample-10BT",
-  "dataset_split": "train",
-  "max_samples": 5,
-  "layers_to_extract": [
-    24,
-    25,
-    26,
-    27
-  ],
-  "batch_size": 2,
-  "max_seq_length": 256,
-  "output_dir": "./test_activations_7b",
-  "upload_to_gcs": false,
-  "gcs_bucket": null,
-  "gcs_prefix": "activations_fineweb",
-  "shard_size_gb": 0.05,
-  "compress_shards": true,
-  "delete_local_after_upload": false,
-  "verbose": true,
-  "use_data_parallel": true
-}
-======================================================================
-
-Machine 0 - Found 4 device(s): ['TPU v4', 'TPU v4', 'TPU v4', 'TPU v4']
-
-Loading dataset shard for machine 0/0...
-  Dataset: HuggingFaceFW/fineweb-edu
-  Config: sample-10BT
-  Split: train
-  ✓ Dataset shard 0 loaded (streaming mode)
-
-Detecting model configuration from Qwen/Qwen2.5-7B...
-  ✓ Loaded config from HuggingFace
-  Model: qwen2
-  Hidden size: 3584
-  Layers: 28
-  Attention heads: 28
-  Vocab size: 152064
-Loading tokenizer from Qwen/Qwen2.5-7B...
-Loading HF model for weight conversion...
-Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:01,  1.74it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.83it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:01<00:00,  1.85it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:02<00:00,  1.92it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:02<00:00,  1.88it/s]
-Creating JAX model with activation hooks for layers [24, 25, 26, 27]...
-Converting HF weights to JAX...
-
-Setting up model sharding across 4 devices...
-  ✓ Created mesh with axis: ('model',)
-  ✓ Created sharding strategy with 12 rules
-  ⟳ Sharding parameters across devices...
-  ✓ Parameters sharded successfully
-
-  Memory distribution across devices:
-    Device 0 (TPU v4): Ready
-    Device 1 (TPU v4): Ready
-    Device 2 (TPU v4): Ready
-    Device 3 (TPU v4): Ready
-
-Extracting activations from layers [24, 25, 26, 27]...
-Mode: Model Sharding
-Extracting activations (sharded): 0it [00:00, ?it/s]Extracting activations (sharded): 1it [00:00,  1.23it/s]Extracting activations (sharded): 3it [00:23,  8.62s/it]Extracting activations (sharded): 5it [00:26,  4.91s/it]Extracting activations (sharded): 5it [00:54, 10.88s/it]
-
-======================================================================
-Saving shard 1: shard_0001.pkl.gz (~52.5 MB)
-======================================================================
-  ✓ Saved locally: 48.6 MB
-    Layer 24: 4 samples
-    Layer 25: 4 samples
-    Layer 26: 4 samples
-    Layer 27: 3 samples
-
-======================================================================
-Saving shard 2: shard_0002.pkl.gz (~17.5 MB)
-======================================================================
-  ✓ Saved locally: 16.2 MB
-    Layer 27: 2 samples
-    Layer 24: 1 samples
-    Layer 25: 1 samples
-    Layer 26: 1 samples
-
-======================================================================
-STORAGE SUMMARY
-======================================================================
-  Total shards: 2
-  Total samples: 20
-  Metadata: test_activations_7b/metadata.json
-======================================================================
-
-======================================================================
-MACHINE 0 - EXTRACTION COMPLETE!
-Activations saved to: ./test_activations_7b
-======================================================================

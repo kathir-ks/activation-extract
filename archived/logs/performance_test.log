@@ -1,2 +1,0 @@
-WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.
-`torch_dtype` is deprecated! Use `dtype` instead!

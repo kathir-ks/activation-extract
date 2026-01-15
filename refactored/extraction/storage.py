@@ -1,0 +1,296 @@
+"""
+Activation Storage Utilities
+
+Handles saving activations to disk and optionally uploading to GCS
+with automatic sharding based on size.
+"""
+
+import json
+import pickle
+import gzip
+import numpy as np
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+
+class ActivationStorage:
+    """Handle saving activations to disk and optionally uploading to GCS with sharding."""
+
+    def __init__(
+        self,
+        output_dir: str,
+        upload_to_gcs: bool = False,
+        gcs_bucket: Optional[str] = None,
+        gcs_prefix: str = 'activations',
+        shard_size_gb: float = 1.0,
+        compress_shards: bool = True,
+        delete_local_after_upload: bool = False,
+        verbose: bool = True
+    ):
+        """
+        Initialize activation storage.
+
+        Args:
+            output_dir: Local directory for saving activations
+            upload_to_gcs: Whether to upload to Google Cloud Storage
+            gcs_bucket: GCS bucket name (required if upload_to_gcs=True)
+            gcs_prefix: Prefix for GCS paths
+            shard_size_gb: Target size for each shard in GB
+            compress_shards: Whether to gzip compress shards
+            delete_local_after_upload: Delete local files after GCS upload
+            verbose: Print progress messages
+        """
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.buffer: Dict[int, List[Dict]] = {}
+        self.buffer_size_bytes = 0
+        self.shard_size_bytes = int(shard_size_gb * 1024 * 1024 * 1024)
+
+        self.metadata: List[Dict] = []
+        self.shard_count = 0
+        self.total_samples = 0
+        self.verbose = verbose
+
+        # GCS settings
+        self.upload_to_gcs = upload_to_gcs
+        self.gcs_bucket = gcs_bucket
+        self.gcs_prefix = gcs_prefix
+        self.compress_shards = compress_shards
+        self.delete_local_after_upload = delete_local_after_upload
+
+        # Initialize filesystem for GCS if needed
+        self.fs = None
+        if self.upload_to_gcs:
+            try:
+                import fsspec
+                self.fs = fsspec.filesystem('gs')
+                if self.verbose:
+                    print(f"Initialized GCS filesystem for bucket: {gcs_bucket}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize GCS filesystem: {e}")
+
+    def add_activation(
+        self,
+        layer_idx: int,
+        activation: np.ndarray,
+        sample_idx: int,
+        text_preview: str
+    ) -> None:
+        """
+        Add activation to buffer and check if shard size exceeded.
+
+        Args:
+            layer_idx: Layer index
+            activation: Activation tensor (numpy array)
+            sample_idx: Sample index for this activation
+            text_preview: Text preview for metadata
+        """
+        if layer_idx not in self.buffer:
+            self.buffer[layer_idx] = []
+
+        activation_data = {
+            'sample_idx': sample_idx,
+            'activation': activation,
+            'shape': activation.shape,
+            'text_preview': text_preview[:200]
+        }
+
+        self.buffer[layer_idx].append(activation_data)
+        self.total_samples += 1
+
+        # Estimate size
+        activation_size = activation.nbytes
+        metadata_overhead = 1024
+        self.buffer_size_bytes += activation_size + metadata_overhead
+
+        # Check if we should save a shard
+        if self.buffer_size_bytes >= self.shard_size_bytes:
+            self._save_shard()
+
+    def add_batch_activations(
+        self,
+        activations: Dict[int, np.ndarray],
+        sample_indices: List[int],
+        text_previews: List[str]
+    ) -> None:
+        """
+        Add a batch of activations for multiple samples.
+
+        Args:
+            activations: Dict mapping layer_idx to batch of activations [batch, seq, hidden]
+            sample_indices: List of sample indices
+            text_previews: List of text previews
+        """
+        for i, (sample_idx, text_preview) in enumerate(zip(sample_indices, text_previews)):
+            for layer_idx, layer_activations in activations.items():
+                if i < len(layer_activations):
+                    self.add_activation(
+                        layer_idx=layer_idx,
+                        activation=layer_activations[i],
+                        sample_idx=sample_idx,
+                        text_preview=text_preview
+                    )
+
+    def _save_shard(self) -> None:
+        """Save current buffer as a shard."""
+        if not self.buffer:
+            return
+
+        self.shard_count += 1
+        shard_name = f"shard_{self.shard_count:04d}.pkl"
+
+        if self.compress_shards:
+            shard_name += ".gz"
+
+        shard_path = self.output_dir / shard_name
+
+        if self.verbose:
+            size_mb = self.buffer_size_bytes / (1024 * 1024)
+            print(f"\nSaving shard {self.shard_count}: {shard_name} (~{size_mb:.1f} MB)")
+
+        # Save to local file
+        if self.compress_shards:
+            with gzip.open(shard_path, 'wb') as f:
+                pickle.dump(self.buffer, f)
+        else:
+            with open(shard_path, 'wb') as f:
+                pickle.dump(self.buffer, f)
+
+        file_size_mb = shard_path.stat().st_size / (1024 * 1024)
+
+        if self.verbose:
+            print(f"  Saved locally: {file_size_mb:.1f} MB")
+            for layer_idx, activations in self.buffer.items():
+                print(f"    Layer {layer_idx}: {len(activations)} samples")
+
+        # Upload to GCS if enabled
+        gcs_path = None
+        if self.upload_to_gcs:
+            gcs_path = self._upload_to_gcs(shard_path, shard_name)
+
+        # Record metadata
+        self.metadata.append({
+            'shard_id': self.shard_count,
+            'filename': shard_name,
+            'local_path': str(shard_path),
+            'gcs_path': gcs_path,
+            'file_size_mb': file_size_mb,
+            'buffer_size_mb': self.buffer_size_bytes / (1024 * 1024),
+            'layers': list(self.buffer.keys()),
+            'samples_per_layer': {layer: len(acts) for layer, acts in self.buffer.items()},
+            'total_samples_in_shard': sum(len(acts) for acts in self.buffer.values())
+        })
+
+        # Delete local file if requested
+        if self.upload_to_gcs and self.delete_local_after_upload and gcs_path:
+            shard_path.unlink()
+            if self.verbose:
+                print("  Deleted local file (uploaded to GCS)")
+
+        # Clear buffer
+        self.buffer = {}
+        self.buffer_size_bytes = 0
+
+    def _upload_to_gcs(self, local_path: Path, shard_name: str) -> Optional[str]:
+        """Upload shard to GCS using fsspec."""
+        try:
+            gcs_path = f"gs://{self.gcs_bucket}/{self.gcs_prefix}/{shard_name}"
+
+            if self.verbose:
+                print(f"  Uploading to {gcs_path}...")
+
+            self.fs.put_file(str(local_path), gcs_path)
+
+            if self.verbose:
+                print(f"  Uploaded to GCS: {gcs_path}")
+
+            return gcs_path
+        except Exception as e:
+            print(f"  Failed to upload to GCS: {e}")
+            return None
+
+    def finalize(self) -> Dict[str, Any]:
+        """Save remaining activations and metadata."""
+        # Save any remaining data
+        if self.buffer:
+            self._save_shard()
+
+        # Save metadata
+        metadata_file = self.output_dir / 'metadata.json'
+        summary = {
+            'total_shards': self.shard_count,
+            'total_samples': self.total_samples,
+            'shard_size_gb': self.shard_size_bytes / (1024 * 1024 * 1024),
+            'upload_to_gcs': self.upload_to_gcs,
+            'gcs_bucket': self.gcs_bucket,
+            'gcs_prefix': self.gcs_prefix,
+            'shards': self.metadata
+        }
+        
+        with open(metadata_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        if self.verbose:
+            print(f"\nSTORAGE SUMMARY")
+            print(f"  Total shards: {self.shard_count}")
+            print(f"  Total samples: {self.total_samples}")
+            print(f"  Metadata: {metadata_file}")
+            if self.upload_to_gcs:
+                print(f"  GCS bucket: gs://{self.gcs_bucket}/{self.gcs_prefix}/")
+
+        return summary
+
+
+def load_activation_shard(shard_path: str, compressed: bool = True) -> Dict:
+    """
+    Load activation shard from disk.
+
+    Args:
+        shard_path: Path to shard file
+        compressed: Whether the shard is gzip compressed
+
+    Returns:
+        Dictionary mapping layer indices to activation lists
+    """
+    if compressed:
+        with gzip.open(shard_path, 'rb') as f:
+            return pickle.load(f)
+    else:
+        with open(shard_path, 'rb') as f:
+            return pickle.load(f)
+
+
+def load_all_shards(output_dir: str) -> Dict[int, List[Dict]]:
+    """
+    Load all activation shards from a directory.
+
+    Args:
+        output_dir: Directory containing shards
+
+    Returns:
+        Merged dictionary of all activations
+    """
+    output_path = Path(output_dir)
+    metadata_file = output_path / 'metadata.json'
+    
+    if not metadata_file.exists():
+        raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
+    
+    with open(metadata_file, 'r') as f:
+        metadata = json.load(f)
+    
+    all_activations: Dict[int, List[Dict]] = {}
+    
+    for shard_info in metadata['shards']:
+        shard_path = output_path / shard_info['filename']
+        compressed = shard_info['filename'].endswith('.gz')
+        
+        shard_data = load_activation_shard(str(shard_path), compressed)
+        
+        for layer_idx, activations in shard_data.items():
+            if layer_idx not in all_activations:
+                all_activations[layer_idx] = []
+            all_activations[layer_idx].extend(activations)
+    
+    return all_activations

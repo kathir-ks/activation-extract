@@ -1,23 +1,0 @@
-WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.
-`torch_dtype` is deprecated! Use `dtype` instead!
-Inference configuration: {'output_filepath': 'submission.json', 'model_path': 'KathirKs/qwen-2.5-0.5b', 'max_model_len': 10240, 'grid_encoder': 'GridShapeEncoder(RowNumberEncoder(MinimalGridEncoder()))', 'prompt_version': 'output-from-examples-v0', 'dataset_path': 'test_data_small.json', 'n_tasks': 1, 'max_output_tokens': 20, 'predictions_per_task': 4, 'temperature': 0.0, 'batch_size': 8, 'random_seed': None, 'verbose': False, 'use_data_parallel': True}
-Initializing TPU...
-Found 4 TPU cores
-There are 1 tasks to solve in test_data_small.json
-Loading KathirKs/qwen-2.5-0.5b...
-Converting HuggingFace weights to JAX format...
-Creating prompts:   0%|          | 0/1 [00:00<?, ?it/s]Creating prompts: 100%|██████████| 1/1 [00:00<00:00, 66.18it/s]
-Generating outputs for 4 prompts (Data Parallel on 4 devices)
-Using 4 devices for parallel generation: ['TPU v4', 'TPU v4', 'TPU v4', 'TPU v4']
-Tokenizing 4 prompts...
-Batch shape after padding: (4, 1, 465)
-  Devices: 4
-  Batch per device: 1
-  Sequence length: 465
-Replicating parameters across devices...
-Generating 20 tokens per prompt in parallel...
-Decoding outputs...
-✓ Generated 4 outputs
-Parsing outputs:   0%|          | 0/4 [00:00<?, ?it/s]Parsing outputs: 100%|██████████| 4/4 [00:00<00:00, 23301.69it/s]
-Inference completed successfully!
-Results saved to submission.json

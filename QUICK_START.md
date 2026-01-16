@@ -1,163 +1,121 @@
-# Quick Start - Build and Deploy on New Machine
+# Quick Start Guide - TPU Activation Extraction
 
-## On Your New Machine
+## ⚡ Fastest Way to Deploy
 
-### 1. Clone Repository
-```bash
-git clone <your-repo-url>
-cd torch_xla/qwen
-```
-
-### 2. Setup GCP
-```bash
-# Login and set project
-gcloud auth login
-export PROJECT_ID="your-project-id"
-gcloud config set project $PROJECT_ID
-gcloud auth configure-docker
-```
-
-### 2.5. Prepare Dataset (see DATASET_GUIDE.md for details)
-```bash
-# Option A: Convert from HuggingFace
-python convert_hf_to_arc_format.py \
-  --dataset_name barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems \
-  --output_file dataset.jsonl \
-  --max_tasks 1000 \
-  --verbose
-
-# Option B: Use existing dataset file
-
-# Upload to GCS
-export BUCKET="your-bucket-name"
-gsutil mb -p $PROJECT_ID -c STANDARD -l us-central1 gs://${BUCKET}
-gsutil cp dataset.jsonl gs://${BUCKET}/
-```
-
-### 3. Build and Push Docker Image
-```bash
-# Build
-docker build -t activation-extraction:latest .
-
-# Tag for GCR
-docker tag activation-extraction:latest gcr.io/${PROJECT_ID}/activation-extraction:latest
-
-# Push to registry
-docker push gcr.io/${PROJECT_ID}/activation-extraction:latest
-```
-
-Build time: ~10 minutes
-Push time: ~5-8 minutes
-
-### 4. Create TPU and Deploy
-
-**Single command deployment (v5e-64, 4 hosts):**
+### Test Run (2 workers, 100 samples) with Auto-Monitoring
 
 ```bash
-export ZONE="us-central1-a"
-export TPU_NAME="arc-extraction"
-export BUCKET="your-bucket-name"
-export DATASET="gs://${BUCKET}/dataset.jsonl"
-export MODEL="KathirKs/qwen-2.5-0.5b"
-
-# Create TPU
-gcloud compute tpus tpu-vm create ${TPU_NAME} \
-  --zone=${ZONE} \
-  --accelerator-type=v5litepod-64 \
-  --version=tpu-ubuntu2204-base
-
-# Get coordinator IP
-COORDINATOR_IP=$(gcloud compute tpus tpu-vm describe ${TPU_NAME} \
-  --zone=${ZONE} --format='value(networkEndpoints[0].ipAddress)')
-
-# Deploy to all 4 workers
-for WORKER in 0 1 2 3; do
-  gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=${WORKER} --command="
-    # Install Docker
-    curl -fsSL https://get.docker.com | sudo sh
-    sudo usermod -aG docker \$USER
-
-    # Pull image
-    gcloud auth configure-docker
-    sudo docker pull gcr.io/${PROJECT_ID}/activation-extraction:latest
-
-    # Run extraction
-    mkdir -p ~/data ~/.cache/huggingface
-    sudo docker run -d --name extraction --net=host --privileged \
-      -v ~/data:/workspace/data \
-      -v ~/.config/gcloud:/root/.config/gcloud:ro \
-      -v ~/.cache/huggingface:/cache/huggingface \
-      gcr.io/${PROJECT_ID}/activation-extraction:latest \
-      -c 'python /workspace/extract_activations_arc_v5e64.py \
-        --host_id ${WORKER} --num_hosts 4 --multihost \
-        --coordinator_address ${COORDINATOR_IP}:8476 \
-        --dataset_path ${DATASET} \
-        --model_path ${MODEL} \
-        --batch_size 4 --max_seq_length 512 \
-        --gcs_bucket ${BUCKET} --upload_to_gcs \
-        --shard_size_gb 1.0 --compress_shards --verbose'
-  " &
-done
-
-wait
-echo "All workers started!"
+./scripts/deploy_to_tpus.sh \
+  --gcs_bucket YOUR_BUCKET_NAME \
+  --zones us-central1-a \
+  --workers_per_zone 2 \
+  --max_samples 100 \
+  --create_tpus \
+  --monitor
 ```
 
-### 5. Monitor
+### Production Run (8 workers, full dataset) with Auto-Monitoring
+
 ```bash
-# Check worker 0 logs
-gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=0 \
-  --command="sudo docker logs -f extraction"
-
-# Check GCS output
-gsutil ls -lh gs://${BUCKET}/activations/
+./scripts/deploy_to_tpus.sh \
+  --gcs_bucket YOUR_BUCKET_NAME \
+  --zones us-central1-a,us-central1-b \
+  --workers_per_zone 4 \
+  --create_tpus \
+  --monitor
 ```
 
-### 6. Cleanup
+**Note:** The `--monitor` flag enables:
+- Live progress dashboard showing samples processed, shards created, and GCS uploads
+- Automatic detection and recovery of preempted TPUs
+- Continuous monitoring until you stop it (Ctrl+C)
+
+## 📋 Common Commands
+
+### Create TPUs
 ```bash
-# Stop all workers
-for i in 0 1 2 3; do
-  gcloud compute tpus tpu-vm ssh ${TPU_NAME} --zone=${ZONE} --worker=$i \
-    --command="sudo docker stop extraction"
-done
-
-# Delete TPU
-gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE}
+./scripts/manage_tpus.sh create --zones us-central1-a --workers_per_zone 4
 ```
 
----
-
-## Performance
-
-With JIT optimizations:
-- **First batch:** 21s (JIT compilation warmup)
-- **Subsequent batches:** 5.7s per batch
-- **8,000 samples:** ~47 minutes on 4 hosts
-
----
-
-## Key Features Enabled
-
-✅ JIT compilation (5-10x faster forward pass)
-✅ Fixed batch sizes (no recompilation)
-✅ Async device→host transfers (2-3x faster)
-✅ Model sharding across TPU devices
-✅ Automatic GCS upload with compression
-
----
-
-## Troubleshooting
-
-**TPU not detected:**
+### Check Status
 ```bash
-sudo docker run --rm --net=host gcr.io/${PROJECT_ID}/activation-extraction:latest \
-  -c "python -c 'import jax; print(jax.devices())'"
+./scripts/manage_tpus.sh status --zones us-central1-a
 ```
 
-**Out of memory:**
-- Reduce `--batch_size` to 2
-- Reduce `--max_seq_length` to 256
+### View Worker Log
+```bash
+gcloud compute tpus tpu-vm ssh tpu-us-central1-a-0 --zone=us-central1-a \
+  --command='tail -f ~/activation-extract/extraction.log'
+```
 
-**Model download slow:**
-- Pre-download model to GCS and mount volume
-- Or increase timeout: `export HF_HUB_DOWNLOAD_TIMEOUT=600`
+### Monitor GCS
+```bash
+gsutil ls gs://YOUR_BUCKET/activations/
+```
+
+### Recreate Preempted TPUs
+```bash
+./scripts/manage_tpus.sh recreate-preempted --zones us-central1-a --workers_per_zone 4
+```
+
+### Delete TPUs
+```bash
+./scripts/manage_tpus.sh delete --zones us-central1-a --workers_per_zone 4
+```
+
+## 📊 Monitoring Mode
+
+The integrated monitoring mode provides:
+- **Live Dashboard**: Real-time view of all TPU workers
+- **Progress Tracking**: Samples processed, shards created, GCS uploads
+- **Auto-Recovery**: Automatically detects and recovers preempted TPUs
+- **Status Summary**: Healthy vs needs-recovery counts
+
+### Start Monitoring
+```bash
+# Add --monitor to any deployment
+./scripts/deploy_to_tpus.sh \
+  --gcs_bucket YOUR_BUCKET \
+  --zones us-central1-a \
+  --workers_per_zone 4 \
+  --monitor
+
+# Customize check interval (default: 60 seconds)
+./scripts/deploy_to_tpus.sh \
+  --gcs_bucket YOUR_BUCKET \
+  --zones us-central1-a \
+  --workers_per_zone 4 \
+  --monitor \
+  --monitor_interval 120
+```
+
+### Dashboard Display
+```
+╔════════════════════════════════════════════════════════════════╗
+║         ACTIVATION EXTRACTION - LIVE MONITORING               ║
+╚════════════════════════════════════════════════════════════════╝
+
+GCS Bucket: gs://your-bucket
+Total Workers: 4 across 1 zone(s)
+Check Interval: 60s
+
+╔════════════════════════════════════════════════════════════════╗
+║  TPU NAME                 STATUS      SAMPLES    SHARDS   GCS  ║
+╠════════════════════════════════════════════════════════════════╣
+║  tpu-us-central1-a-0      READY        1250       150     150  ║
+║  tpu-us-central1-a-1      READY        1180       142     142  ║
+║  tpu-us-central1-a-2      PREEMPT         0         0       0  ║
+║  tpu-us-central1-a-3      READY        1300       156     156  ║
+╠════════════════════════════════════════════════════════════════╣
+║  TOTALS                                3730       448     448  ║
+╚════════════════════════════════════════════════════════════════╝
+
+Status Summary:
+  ✓ Healthy: 3
+  ⟳ Working: 3
+  ✗ Needs Recovery: 1
+```
+
+## Full Documentation
+
+See **README_DEPLOYMENT.md** for complete guide.

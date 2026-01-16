@@ -135,6 +135,7 @@ class ExtractionConfig:
 
     # Extraction config
     layers_to_extract: Optional[List[int]] = None
+    activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 4
     max_seq_length: int = 2048
 
@@ -268,6 +269,10 @@ def main():
     # Extraction args
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--layers_to_extract', type=int, nargs='+')
+    parser.add_argument('--activation_type', type=str, default='residual',
+                        choices=['residual', 'mlp', 'attn'],
+                        help="Type of activation to extract: 'residual' (layer output after both residuals), "
+                             "'mlp' (MLP output before residual), 'attn' (attention output before residual)")
     parser.add_argument('--max_seq_length', type=int, default=2048)
 
     # Output args
@@ -401,7 +406,8 @@ def main():
     )
 
     print(f"Creating JAX model with hooks...")
-    jax_model = create_model_with_hooks(config, layers_to_extract=cfg.layers_to_extract)
+    print(f"  ✓ Activation type: {cfg.activation_type}")
+    jax_model = create_model_with_hooks(config, layers_to_extract=cfg.layers_to_extract, activation_type=cfg.activation_type)
 
     print(f"Converting weights to JAX...")
     converted_params = convert_hf_to_jax_weights(hf_model, config)

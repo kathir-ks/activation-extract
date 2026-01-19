@@ -53,32 +53,33 @@ def convert_hf_dataset_to_arc_format(
     try:
         # Stream the dataset to avoid loading it all into memory
         dataset = load_dataset(dataset_name, split="train", streaming=True)
+
+        # OPTIMIZED: Use skip() and take() instead of manual iteration
+        if start_index > 0:
+            if verbose:
+                print(f"Skipping first {start_index} samples...")
+            dataset = dataset.skip(start_index)
+
+        if end_index is not None:
+            num_samples = end_index - start_index
+            dataset = dataset.take(num_samples)
+            if verbose:
+                print(f"Taking {num_samples} samples...")
+
     except Exception as e:
         print(f"❌ Error loading dataset '{dataset_name}'")
         print(f"   {e}")
         return
 
     task_counter = 0
-    current_index = 0
     skipped_invalid = 0
 
     try:
         with open(output_filename, 'w') as f:
             for sample in tqdm(dataset, desc="Converting", disable=not verbose):
-                # Skip until we reach start_index
-                if current_index < start_index:
-                    current_index += 1
-                    continue
-
-                # Stop if we've reached end_index
-                if end_index is not None and current_index >= end_index:
-                    break
-
                 # Stop if we've reached max_tasks
                 if max_tasks is not None and task_counter >= max_tasks:
                     break
-
-                current_index += 1
 
                 # Validate column exists
                 if column_name not in sample:

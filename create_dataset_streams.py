@@ -5,6 +5,8 @@ Create Dataset Streams for Parallel Workers
 Splits a HuggingFace dataset into N independent JSONL streams for parallel processing.
 Each stream will be processed by one TPU worker.
 
+OPTIMIZED: Loads dataset once and creates all streams in a single pass.
+
 Usage:
     # Split into 32 streams
     python create_dataset_streams.py \
@@ -20,9 +22,65 @@ Usage:
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
-from convert_hf_to_arc_format import convert_hf_dataset_to_arc_format
+from datasets import load_dataset
+from tqdm import tqdm
+
+
+def convert_sample_to_arc_format(sample, column_name: str, task_id: str):
+    """
+    Convert a single HF sample to ARC format.
+
+    Returns:
+        dict: ARC formatted task, or None if invalid
+    """
+    if column_name not in sample:
+        return None
+
+    task_pairs = sample[column_name]
+
+    # Validate format: must be list with at least 2 pairs (train + test)
+    if not isinstance(task_pairs, list) or len(task_pairs) < 2:
+        return None
+
+    # Split into train/test: last pair is test, rest are train
+    train_pairs = task_pairs[:-1]
+    test_pair = task_pairs[-1]
+
+    # Format training data
+    formatted_train_list = []
+    for pair in train_pairs:
+        if isinstance(pair, list) and len(pair) == 2:
+            try:
+                input_grid = [[int(cell) for cell in row] for row in pair[0]]
+                output_grid = [[int(cell) for cell in row] for row in pair[1]]
+                formatted_train_list.append({
+                    "input": input_grid,
+                    "output": output_grid
+                })
+            except (ValueError, TypeError):
+                continue
+
+    if len(formatted_train_list) == 0:
+        return None
+
+    # Format test data
+    if isinstance(test_pair, list) and len(test_pair) > 0:
+        try:
+            test_input_grid = [[int(cell) for cell in row] for row in test_pair[0]]
+            formatted_test_list = [{"input": test_input_grid}]
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+
+    return {
+        "task_id": task_id,
+        "train": formatted_train_list,
+        "test": formatted_test_list
+    }
 
 
 def create_streams(
@@ -34,7 +92,9 @@ def create_streams(
     verbose: bool = True
 ):
     """
-    Create N dataset streams by splitting the dataset into equal parts
+    Create N dataset streams by splitting the dataset into equal parts.
+
+    OPTIMIZED: Loads dataset once and writes to all stream files in a single pass.
 
     Args:
         dataset_name: HuggingFace dataset name
@@ -57,63 +117,71 @@ def create_streams(
         print(f"  Output directory: {output_dir}")
         print(f"  Max samples: {max_samples if max_samples else 'unlimited'}")
         print("="*70)
+        print("\nLoading dataset (streaming mode)...")
 
-    # Calculate samples per stream
-    if max_samples:
-        samples_per_stream = max_samples // num_streams
-        remainder = max_samples % num_streams
-    else:
-        # If no max_samples, we'll process all data
-        # HF streaming will handle this automatically
-        samples_per_stream = None
-        remainder = 0
+    # Load dataset in streaming mode
+    dataset = load_dataset(dataset_name, split="train", streaming=True)
 
-    # Create each stream
-    for stream_id in range(num_streams):
-        if samples_per_stream:
-            start_idx = stream_id * samples_per_stream
-            # Distribute remainder across first few streams
-            if stream_id < remainder:
-                start_idx += stream_id
-                end_idx = start_idx + samples_per_stream + 1
+    # Open all stream files at once
+    stream_files = []
+    stream_counters = [0] * num_streams  # Track samples per stream
+
+    for i in range(num_streams):
+        filepath = output_path / f"stream_{i:03d}.jsonl"
+        stream_files.append(open(filepath, 'w'))
+
+    if verbose:
+        print(f"Opened {num_streams} stream files for writing")
+        print("Processing dataset in single pass...")
+
+    total_processed = 0
+    total_invalid = 0
+
+    try:
+        # Single pass through dataset
+        pbar = tqdm(dataset, desc="Processing", disable=not verbose)
+        for sample in pbar:
+            # Check max_samples limit
+            if max_samples and total_processed >= max_samples:
+                break
+
+            # Determine which stream this sample belongs to (round-robin)
+            stream_id = total_processed % num_streams
+
+            # Convert to ARC format
+            task_id = f"task_{total_processed:08x}"
+            arc_task = convert_sample_to_arc_format(sample, column_name, task_id)
+
+            if arc_task:
+                stream_files[stream_id].write(json.dumps(arc_task) + '\n')
+                stream_counters[stream_id] += 1
+                total_processed += 1
+
+                if verbose and total_processed % 10000 == 0:
+                    pbar.set_postfix({
+                        'processed': total_processed,
+                        'per_stream': f"~{total_processed // num_streams}"
+                    })
             else:
-                start_idx += remainder
-                end_idx = start_idx + samples_per_stream
-        else:
-            # No limits, but still need to shard
-            # This will require streaming with skip/stride
-            start_idx = stream_id
-            end_idx = None
+                total_invalid += 1
 
-        output_file = output_path / f"stream_{stream_id:03d}.jsonl"
-
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f"Creating stream {stream_id}/{num_streams-1}")
-            print(f"{'='*70}")
-            if samples_per_stream:
-                print(f"  Range: {start_idx} to {end_idx-1}")
-                print(f"  Samples: {end_idx - start_idx}")
-            print(f"  Output: {output_file}")
-            print(f"{'='*70}")
-
-        # Convert this slice of the dataset
-        convert_hf_dataset_to_arc_format(
-            dataset_name=dataset_name,
-            column_name=column_name,
-            output_filename=str(output_file),
-            max_tasks=None,  # Don't limit per stream, use start/end
-            start_index=start_idx,
-            end_index=end_idx,
-            verbose=verbose
-        )
+    finally:
+        # Close all files
+        for f in stream_files:
+            f.close()
 
     if verbose:
         print(f"\n{'='*70}")
         print("✅ ALL STREAMS CREATED SUCCESSFULLY")
         print("="*70)
+        print(f"  Total samples processed: {total_processed}")
+        print(f"  Invalid samples skipped: {total_invalid}")
         print(f"  Total streams: {num_streams}")
+        print(f"  Samples per stream: ~{total_processed // num_streams}")
         print(f"  Location: {output_dir}")
+        print(f"\n  Stream distribution:")
+        for i, count in enumerate(stream_counters):
+            print(f"    Stream {i:03d}: {count} samples")
         print(f"\nYou can now launch parallel workers with:")
         print(f"  export TPU_WORKER_ID=0")
         print(f"  python extract_activations.py --dataset_path {output_dir}/stream_${{TPU_WORKER_ID}}.jsonl ...")

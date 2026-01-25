@@ -12,7 +12,15 @@ from .jax_utils import (
     extract_activations_sharded,
     pad_sequences,
     get_device_memory_info,
-    P  # PartitionSpec alias
+    P,  # PartitionSpec alias
+    # Multihost utilities
+    initialize_multihost_auto,
+    get_host_info,
+    distribute_data_across_hosts,
+    gather_activations_to_primary,
+    sync_hosts,
+    is_primary_host,
+    get_per_host_batch_indices,
 )
 
 from .dataset_utils import (
@@ -22,6 +30,17 @@ from .dataset_utils import (
 )
 
 from .activation_storage import ActivationStorage, load_activation_shard
+
+from .mesh_configs import (
+    TopologyConfig,
+    TPU_TOPOLOGIES,
+    get_topology_config,
+    detect_topology,
+    create_mesh_for_topology,
+    create_sharding_specs,
+    get_per_host_batch_size,
+    validate_batch_size,
+)
 
 __all__ = [
     # JAX utilities
@@ -33,6 +52,25 @@ __all__ = [
     'pad_sequences',
     'get_device_memory_info',
     'P',
+
+    # Multihost utilities
+    'initialize_multihost_auto',
+    'get_host_info',
+    'distribute_data_across_hosts',
+    'gather_activations_to_primary',
+    'sync_hosts',
+    'is_primary_host',
+    'get_per_host_batch_indices',
+
+    # Mesh configuration
+    'TopologyConfig',
+    'TPU_TOPOLOGIES',
+    'get_topology_config',
+    'detect_topology',
+    'create_mesh_for_topology',
+    'create_sharding_specs',
+    'get_per_host_batch_size',
+    'validate_batch_size',
 
     # Dataset utilities
     'load_arc_dataset_jsonl',

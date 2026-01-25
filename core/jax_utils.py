@@ -289,3 +289,243 @@ def get_device_memory_info() -> Dict[str, float]:
         }
     except:
         return {}
+
+
+# =============================================================================
+# Multihost TPU Utilities
+# =============================================================================
+
+def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
+    """
+    Auto-initialize JAX distributed from environment variables
+    
+    This function detects multihost configuration from TPU pod environment
+    variables set by Google Cloud TPU runtime.
+    
+    Environment variables checked:
+    - TPU_WORKER_HOSTNAMES: Comma-separated list of worker hostnames
+    - MEGASCALE_COORDINATOR_ADDRESS: Alternative coordinator address
+    - TPU_WORKER_ID / CLOUD_TPU_TASK_ID: This host's ID
+    - TPU_WORKER_COUNT: Total number of hosts
+    
+    Returns:
+        Dict with host_id, num_hosts, coordinator_address, total_devices
+    """
+    import os
+    
+    # Try to get coordinator address
+    coordinator_address = None
+    hostnames = os.environ.get('TPU_WORKER_HOSTNAMES', '')
+    
+    if hostnames:
+        # Use first hostname as coordinator
+        first_host = hostnames.split(',')[0].strip()
+        coordinator_address = f"{first_host}:8476"
+    else:
+        # Try alternative env var
+        coordinator_address = os.environ.get('MEGASCALE_COORDINATOR_ADDRESS')
+    
+    # Get host ID
+    host_id = int(os.environ.get('TPU_WORKER_ID', 
+                   os.environ.get('CLOUD_TPU_TASK_ID', '0')))
+    
+    # Get number of hosts
+    num_hosts = int(os.environ.get('TPU_WORKER_COUNT', '1'))
+    
+    # If we have multiple hosts but no coordinator, we're in a pod
+    if num_hosts > 1 and coordinator_address is None:
+        raise RuntimeError(
+            "Multihost environment detected but no coordinator address found. "
+            "Set TPU_WORKER_HOSTNAMES or MEGASCALE_COORDINATOR_ADDRESS"
+        )
+    
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"Multihost Auto-Detection")
+        print(f"{'='*70}")
+        print(f"  Host ID: {host_id}")
+        print(f"  Num hosts: {num_hosts}")
+        print(f"  Coordinator: {coordinator_address}")
+    
+    # Initialize if multihost
+    if num_hosts > 1:
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_hosts,
+            process_id=host_id
+        )
+        total_devices = jax.device_count()
+    else:
+        total_devices = len(jax.devices())
+    
+    if verbose:
+        print(f"  Local devices: {jax.local_device_count()}")
+        print(f"  Total devices: {total_devices}")
+        print(f"{'='*70}\n")
+    
+    return {
+        'host_id': host_id,
+        'num_hosts': num_hosts,
+        'coordinator_address': coordinator_address,
+        'total_devices': total_devices,
+        'local_devices': jax.local_device_count(),
+        'is_primary': host_id == 0,
+    }
+
+
+def get_host_info() -> Dict[str, any]:
+    """
+    Get information about the current host in a multihost setup
+    
+    Returns:
+        Dict with:
+        - host_id: This host's process ID
+        - num_hosts: Total number of hosts/processes
+        - local_device_count: Devices on this host
+        - global_device_count: Total devices across all hosts
+        - is_primary: Whether this is host 0
+    """
+    return {
+        'host_id': jax.process_index(),
+        'num_hosts': jax.process_count(),
+        'local_device_count': jax.local_device_count(),
+        'global_device_count': jax.device_count(),
+        'is_primary': jax.process_index() == 0,
+    }
+
+
+def distribute_data_across_hosts(
+    data: list,
+    host_id: Optional[int] = None,
+    num_hosts: Optional[int] = None
+) -> list:
+    """
+    Distribute data across hosts in round-robin fashion
+    
+    Each host gets every Nth item where N = num_hosts.
+    
+    Args:
+        data: List of items to distribute
+        host_id: This host's ID (auto-detected if None)
+        num_hosts: Total hosts (auto-detected if None)
+        
+    Returns:
+        Subset of data for this host
+    """
+    if host_id is None:
+        host_id = jax.process_index()
+    if num_hosts is None:
+        num_hosts = jax.process_count()
+    
+    # Round-robin distribution
+    return data[host_id::num_hosts]
+
+
+def gather_activations_to_primary(
+    local_activations: Dict[str, jnp.ndarray],
+    host_id: Optional[int] = None,
+) -> Optional[Dict[str, jnp.ndarray]]:
+    """
+    Gather activations from all hosts to the primary host (host 0)
+    
+    Uses JAX multihost utilities for efficient cross-host communication.
+    
+    Args:
+        local_activations: Dict of activations from this host
+        host_id: This host's ID (auto-detected if None)
+        
+    Returns:
+        On host 0: Dict of gathered activations (concatenated along batch dim)
+        On other hosts: None
+    """
+    from jax.experimental import multihost_utils
+    
+    if host_id is None:
+        host_id = jax.process_index()
+    
+    num_hosts = jax.process_count()
+    
+    if num_hosts == 1:
+        # Single host, no gathering needed
+        return local_activations
+    
+    # Gather each layer's activations
+    gathered = {}
+    for layer_name, activation in local_activations.items():
+        # Use process_allgather to collect from all hosts
+        # This returns the same gathered array on all hosts
+        all_activations = multihost_utils.process_allgather(activation)
+        gathered[layer_name] = all_activations
+    
+    # Only primary host returns the gathered data
+    if host_id == 0:
+        return gathered
+    else:
+        return None
+
+
+def sync_hosts(tag: str = "sync"):
+    """
+    Synchronize all hosts at a barrier point
+    
+    All hosts must call this function before any can proceed.
+    Useful for coordinating checkpointing and uploads.
+    
+    Args:
+        tag: Unique identifier for this sync point
+    """
+    from jax.experimental import multihost_utils
+    
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices(tag)
+
+
+def is_primary_host() -> bool:
+    """Check if this is the primary host (host 0)"""
+    return jax.process_index() == 0
+
+
+def get_per_host_batch_indices(
+    total_samples: int,
+    batch_size: int,
+    host_id: Optional[int] = None,
+    num_hosts: Optional[int] = None
+) -> list:
+    """
+    Get batch indices for this host
+    
+    Divides samples evenly across hosts for balanced processing.
+    
+    Args:
+        total_samples: Total number of samples
+        batch_size: Batch size per host
+        host_id: This host's ID
+        num_hosts: Total number of hosts
+        
+    Returns:
+        List of (start_idx, end_idx) tuples for batches this host should process
+    """
+    if host_id is None:
+        host_id = jax.process_index()
+    if num_hosts is None:
+        num_hosts = jax.process_count()
+    
+    # Calculate samples per host
+    samples_per_host = total_samples // num_hosts
+    remainder = total_samples % num_hosts
+    
+    # Distribute remainder to first few hosts
+    if host_id < remainder:
+        start = host_id * (samples_per_host + 1)
+        end = start + samples_per_host + 1
+    else:
+        start = host_id * samples_per_host + remainder
+        end = start + samples_per_host
+    
+    # Generate batch indices for this host's portion
+    batches = []
+    for batch_start in range(start, end, batch_size):
+        batch_end = min(batch_start + batch_size, end)
+        batches.append((batch_start, batch_end))
+    
+    return batches

@@ -21,6 +21,8 @@ ACCELERATOR_TYPE="v3-8"
 RUNTIME_VERSION="tpu-ubuntu2204-base"
 PREEMPTIBLE=true
 PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
+MAX_RETRIES=1000000  # Maximum retry attempts for preemptible TPU creation (essentially infinite)
+RETRY_DELAY=30  # Delay in seconds between retries
 
 # Colors
 GREEN='\033[0;32m'
@@ -47,6 +49,8 @@ Options:
   --runtime VERSION     Runtime version (default: $RUNTIME_VERSION)
   --no-preemptible      Create non-preemptible TPUs (not recommended for cost)
   --project PROJECT     GCP project ID (default: from gcloud config)
+  --max_retries N       Max retry attempts for preemptible TPU creation (default: $MAX_RETRIES)
+  --retry_delay N       Delay in seconds between retries (default: $RETRY_DELAY)
 
 Naming Convention:
   TPU names follow: tpu-{region}-{zone_letter}-{worker_id}
@@ -101,19 +105,30 @@ function create_tpu() {
         project_flag="--project=$PROJECT"
     fi
 
-    gcloud compute tpus tpu-vm create "$tpu_name" \
-        --zone="$zone" \
-        --accelerator-type="$ACCELERATOR_TYPE" \
-        --version="$RUNTIME_VERSION" \
-        $preempt_flag \
-        $project_flag \
-        --quiet || {
-            echo -e "${RED}✗ Failed to create $tpu_name${NC}"
-            return 1
-        }
+    # Retry loop for preemptible TPUs (capacity may not be available immediately)
+    local retry_count=0
+    while [ $retry_count -lt $MAX_RETRIES ]; do
+        if gcloud compute tpus tpu-vm create "$tpu_name" \
+            --zone="$zone" \
+            --accelerator-type="$ACCELERATOR_TYPE" \
+            --version="$RUNTIME_VERSION" \
+            $preempt_flag \
+            $project_flag \
+            --quiet 2>&1; then
+            echo -e "${GREEN}✓ Created $tpu_name${NC}"
+            return 0
+        fi
 
-    echo -e "${GREEN}✓ Created $tpu_name${NC}"
-    return 0
+        retry_count=$((retry_count + 1))
+
+        if [ $retry_count -lt $MAX_RETRIES ]; then
+            echo -e "${YELLOW}  Retry $retry_count/$MAX_RETRIES for $tpu_name (waiting ${RETRY_DELAY}s for capacity)...${NC}"
+            sleep $RETRY_DELAY
+        fi
+    done
+
+    echo -e "${RED}✗ Failed to create $tpu_name after $MAX_RETRIES retries${NC}"
+    return 1
 }
 
 function delete_tpu() {
@@ -185,6 +200,10 @@ function command_create() {
     echo "TPU type: $TPU_TYPE"
     echo "Runtime: $RUNTIME_VERSION"
     echo "Preemptible: $PREEMPTIBLE"
+    if [ "$PREEMPTIBLE" = true ]; then
+        echo "Max retries per TPU: $MAX_RETRIES"
+        echo "Retry delay: ${RETRY_DELAY}s"
+    fi
     echo ""
 
     IFS=',' read -ra ZONE_ARRAY <<< "$zones"
@@ -196,21 +215,55 @@ function command_create() {
     local created=0
     local failed=0
 
+    # Arrays to track background jobs
+    declare -a pids=()
+    declare -a tpu_names=()
+    declare -a tpu_zones=()
+
+    echo -e "${YELLOW}Starting parallel TPU creation...${NC}"
+    echo ""
+
+    # Launch all TPU creation commands in parallel
     for zone in "${ZONE_ARRAY[@]}"; do
-        echo -e "${YELLOW}--- Zone: $zone ---${NC}"
-
         for worker_id in $(seq 0 $((workers_per_zone - 1))); do
-            if create_tpu "$zone" "$worker_id"; then
-                ((created++))
-            else
-                ((failed++))
-            fi
-            sleep 2  # Avoid rate limiting
-        done
+            local tpu_name=$(get_tpu_name "$zone" "$worker_id")
 
-        echo ""
+            # Run create_tpu in background
+            (create_tpu "$zone" "$worker_id") &
+            local pid=$!
+
+            pids+=("$pid")
+            tpu_names+=("$tpu_name")
+            tpu_zones+=("$zone")
+
+            # Stagger launches slightly to avoid overwhelming the API
+            sleep 0.5
+        done
     done
 
+    echo -e "${YELLOW}Waiting for all TPU creation jobs to complete...${NC}"
+    echo ""
+
+    # Wait for all background jobs and collect results
+    for i in "${!pids[@]}"; do
+        local pid="${pids[$i]}"
+        local tpu_name="${tpu_names[$i]}"
+        local zone="${tpu_zones[$i]}"
+
+        # Disable set -e to handle job failures gracefully
+        set +e
+        wait "$pid"
+        local exit_code=$?
+        set -e
+
+        if [ $exit_code -eq 0 ]; then
+            created=$((created + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    echo ""
     echo -e "${GREEN}=========================================="
     echo "CREATE SUMMARY"
     echo -e "==========================================${NC}"
@@ -411,6 +464,8 @@ while [[ "$#" -gt 0 ]]; do
         --runtime) RUNTIME_VERSION="$2"; shift ;;
         --no-preemptible) PREEMPTIBLE=false ;;
         --project) PROJECT="$2"; shift ;;
+        --max_retries) MAX_RETRIES="$2"; shift ;;
+        --retry_delay) RETRY_DELAY="$2"; shift ;;
         -h|--help) print_usage; exit 0 ;;
         *) echo -e "${RED}Unknown option: $1${NC}"; print_usage; exit 1 ;;
     esac

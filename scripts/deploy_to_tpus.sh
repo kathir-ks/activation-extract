@@ -41,6 +41,7 @@ SKIP_DATASET=false
 SKIP_LAUNCH=false
 MONITOR=false
 MONITOR_INTERVAL=60  # Check interval in seconds
+NOHUP=false  # Run monitoring in background with nohup
 
 # Global tracking
 declare -A TPU_TO_STREAM  # Map TPU name -> dataset stream path
@@ -71,9 +72,18 @@ Optional:
   --skip_launch             Skip launching extraction (just prepare)
   --monitor                 Enable continuous monitoring with auto-recovery
   --monitor_interval N      Monitoring check interval in seconds (default: $MONITOR_INTERVAL)
+  --nohup                   Run monitoring in background with nohup (requires --monitor)
 
 Examples:
-  # Full deployment with monitoring and auto-recovery
+  # Full deployment with background monitoring (recommended for long-running jobs)
+  $0 --gcs_bucket my-bucket \\
+     --zones us-central1-a,us-central1-b \\
+     --workers_per_zone 4 \\
+     --create_tpus \\
+     --monitor \\
+     --nohup
+
+  # Full deployment with foreground monitoring
   $0 --gcs_bucket my-bucket \\
      --zones us-central1-a,us-central1-b \\
      --workers_per_zone 4 \\
@@ -88,12 +98,13 @@ Examples:
      --create_tpus \\
      --monitor
 
-  # Just launch extraction (TPUs already exist) with monitoring
+  # Just launch extraction (TPUs already exist) with background monitoring
   $0 --gcs_bucket my-bucket \\
      --zones us-central1-a \\
      --workers_per_zone 4 \\
      --skip_dataset \\
-     --monitor
+     --monitor \\
+     --nohup
 
   # Without monitoring (manual management)
   $0 --gcs_bucket my-bucket \\
@@ -146,6 +157,7 @@ while [[ "$#" -gt 0 ]]; do
         --skip_dataset) SKIP_DATASET=true ;;
         --skip_launch) SKIP_LAUNCH=true ;;
         --monitor) MONITOR=true ;;
+        --nohup) NOHUP=true ;;
         -h|--help) print_usage; exit 0 ;;
         *) echo -e "${RED}Unknown parameter: $1${NC}"; print_usage; exit 1 ;;
     esac
@@ -155,6 +167,13 @@ done
 # Validate required arguments
 if [ -z "$GCS_BUCKET" ] || [ -z "$ZONES" ] || [ -z "$WORKERS_PER_ZONE" ]; then
     echo -e "${RED}Error: --gcs_bucket, --zones, and --workers_per_zone are required${NC}"
+    print_usage
+    exit 1
+fi
+
+# Validate nohup flag
+if [ "$NOHUP" = true ] && [ "$MONITOR" = false ]; then
+    echo -e "${RED}Error: --nohup requires --monitor to be enabled${NC}"
     print_usage
     exit 1
 fi
@@ -185,18 +204,6 @@ function get_tpu_name() {
     echo "tpu-${region}-${zone_letter}-${worker_id}"
 }
 
-# Get TPU status
-function get_tpu_status() {
-    local zone=$1
-    local tpu_name=$2
-
-    local status=$(gcloud compute tpus tpu-vm describe "$tpu_name" \
-        --zone="$zone" \
-        --format="value(state)" 2>/dev/null || echo "NOT_FOUND")
-
-    echo "$status"
-}
-
 # Get worker progress from checkpoint
 function get_worker_progress() {
     local zone=$1
@@ -221,33 +228,6 @@ function get_gcs_shard_count() {
 
     local count=$(gsutil ls "gs://$GCS_BUCKET/$GCS_ACTIVATION_PREFIX/tpu_${worker_id}/*.pkl.gz" 2>/dev/null | wc -l || echo "0")
     echo "$count"
-}
-
-# Delete TPU
-function delete_tpu() {
-    local zone=$1
-    local tpu_name=$2
-
-    gcloud compute tpus tpu-vm delete "$tpu_name" \
-        --zone="$zone" \
-        --quiet &>/dev/null
-
-    return $?
-}
-
-# Create TPU
-function create_tpu() {
-    local zone=$1
-    local tpu_name=$2
-
-    gcloud compute tpus tpu-vm create "$tpu_name" \
-        --zone="$zone" \
-        --accelerator-type="$TPU_TYPE" \
-        --version="tpu-ubuntu2204-base" \
-        --preemptible \
-        --quiet &>/dev/null
-
-    return $?
 }
 
 # Launch extraction on TPU
@@ -275,35 +255,57 @@ function launch_extraction() {
     return $?
 }
 
-# Recover preempted TPU
-function recover_preempted_tpu() {
+# Create single TPU with infinite retry logic
+function create_tpu() {
     local zone=$1
     local tpu_name=$2
-    local dataset_stream=$3
 
-    echo -e "${YELLOW}⟳ Recovering $tpu_name...${NC}"
+    local retry_count=0
+    local max_retries=1000000  # Essentially infinite
+    local retry_delay=30
 
-    # Delete if exists
-    delete_tpu "$zone" "$tpu_name"
-    sleep 5
+    while [ $retry_count -lt $max_retries ]; do
+        if gcloud compute tpus tpu-vm create "$tpu_name" \
+            --zone="$zone" \
+            --accelerator-type="$TPU_TYPE" \
+            --version="tpu-ubuntu2204-base" \
+            --preemptible \
+            --quiet 2>&1; then
+            return 0
+        fi
 
-    # Recreate
-    if ! create_tpu "$zone" "$tpu_name"; then
-        echo -e "${RED}✗ Failed to create $tpu_name${NC}"
-        return 1
-    fi
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $max_retries ]; then
+            echo -e "${YELLOW}[TPU Lifecycle]   Retry $retry_count for $tpu_name (waiting ${retry_delay}s)...${NC}"
+            sleep $retry_delay
+        fi
+    done
 
-    # Wait for initialization
-    sleep 30
+    return 1
+}
 
-    # Relaunch extraction
-    if ! launch_extraction "$zone" "$tpu_name" "$dataset_stream"; then
-        echo -e "${RED}✗ Failed to launch extraction on $tpu_name${NC}"
-        return 1
-    fi
+# Delete TPU
+function delete_tpu() {
+    local zone=$1
+    local tpu_name=$2
 
-    echo -e "${GREEN}✓ Recovered $tpu_name${NC}"
-    return 0
+    gcloud compute tpus tpu-vm delete "$tpu_name" \
+        --zone="$zone" \
+        --quiet 2>/dev/null
+
+    return $?
+}
+
+# Get TPU status
+function get_tpu_status() {
+    local zone=$1
+    local tpu_name=$2
+
+    local status=$(gcloud compute tpus tpu-vm describe "$tpu_name" \
+        --zone="$zone" \
+        --format="value(state)" 2>/dev/null || echo "NOT_FOUND")
+
+    echo "$status"
 }
 
 # Display progress dashboard
@@ -345,20 +347,20 @@ function display_progress() {
             case "$status" in
                 READY)
                     status_display="${GREEN}READY  ${NC}"
-                    ((healthy_count++))
-                    ((working_count++))
+                    healthy_count=$((healthy_count + 1))
+                    working_count=$((working_count + 1))
                     ;;
                 PREEMPTED)
                     status_display="${RED}PREEMPT${NC}"
-                    ((preempted_count++))
+                    preempted_count=$((preempted_count + 1))
                     ;;
                 NOT_FOUND)
                     status_display="${RED}MISSING${NC}"
-                    ((preempted_count++))
+                    preempted_count=$((preempted_count + 1))
                     ;;
                 CREATING|STARTING)
                     status_display="${YELLOW}STARTING${NC}"
-                    ((working_count++))
+                    working_count=$((working_count + 1))
                     ;;
                 *)
                     status_display="${YELLOW}${status:0:7}${NC}"
@@ -366,9 +368,9 @@ function display_progress() {
             esac
 
             # Accumulate totals
-            ((total_samples += samples))
-            ((total_shards += shards))
-            ((total_gcs += gcs_count))
+            total_samples=$((total_samples + samples))
+            total_shards=$((total_shards + shards))
+            total_gcs=$((total_gcs + gcs_count))
 
             # Print row
             printf "${CYAN}║${NC}  %-25s %b  %7s  %7s  %5s ${CYAN}║${NC}\n" \
@@ -391,64 +393,166 @@ function display_progress() {
     echo ""
 }
 
-# Main monitoring loop
-function monitor_and_manage() {
-    echo -e "${GREEN}=========================================="
-    echo "STARTING CONTINUOUS MONITORING"
-    echo -e "==========================================${NC}"
-    echo "Monitor interval: ${MONITOR_INTERVAL}s"
-    echo "Auto-recovery: ENABLED"
-    echo ""
-    echo "Press Ctrl+C to stop"
-    sleep 3
+# Loop 1: TPU Lifecycle Management
+# Continuously ensures all TPUs exist and recreates them on preemption
+function tpu_lifecycle_loop() {
+    echo -e "${GREEN}[TPU Lifecycle] Starting continuous TPU lifecycle management${NC}"
 
     local cycle=0
+    set +e  # Don't crash on errors
 
     while true; do
-        ((cycle++))
+        cycle=$((cycle + 1))
+        echo -e "${BLUE}[TPU Lifecycle] Cycle $cycle - Checking TPU health...${NC}"
 
-        # Display progress
-        display_progress
-
-        # Check for preempted TPUs and recover
         for zone in "${ZONE_ARRAY[@]}"; do
             for worker_id in $(seq 0 $((WORKERS_PER_ZONE - 1))); do
                 local tpu_name=$(get_tpu_name "$zone" "$worker_id")
                 local status=$(get_tpu_status "$zone" "$tpu_name")
 
+                # If TPU doesn't exist or is preempted, recreate it
                 if [ "$status" = "PREEMPTED" ] || [ "$status" = "NOT_FOUND" ] || [ "$status" = "TERMINATED" ]; then
-                    local dataset_stream="${TPU_TO_STREAM[$tpu_name]}"
-                    recover_preempted_tpu "$zone" "$tpu_name" "$dataset_stream"
+                    echo -e "${YELLOW}[TPU Lifecycle] $tpu_name is $status - recreating...${NC}"
+
+                    # Delete if exists
+                    delete_tpu "$zone" "$tpu_name" 2>/dev/null || true
+                    sleep 5
+
+                    # Recreate with infinite retries
+                    create_tpu "$zone" "$tpu_name" && \
+                        echo -e "${GREEN}[TPU Lifecycle] ✓ $tpu_name recreated${NC}" || \
+                        echo -e "${YELLOW}[TPU Lifecycle] Will retry $tpu_name next cycle${NC}"
                 fi
             done
         done
 
-        # Wait for next cycle
         sleep "$MONITOR_INTERVAL"
     done
 }
 
-# Step 0: Create TPUs if requested
-if [ "$CREATE_TPUS" = true ]; then
+# Loop 2: Extraction Management
+# Continuously ensures extraction is running on all READY TPUs
+function extraction_management_loop() {
+    echo -e "${GREEN}[Extraction] Starting continuous extraction management${NC}"
+
+    local cycle=0
+    set +e  # Don't crash on errors
+
+    # Track which TPUs have extraction running
+    declare -A EXTRACTION_RUNNING
+
+    while true; do
+        cycle=$((cycle + 1))
+        echo -e "${BLUE}[Extraction] Cycle $cycle - Checking extraction status...${NC}"
+
+        for zone in "${ZONE_ARRAY[@]}"; do
+            for worker_id in $(seq 0 $((WORKERS_PER_ZONE - 1))); do
+                local tpu_name=$(get_tpu_name "$zone" "$worker_id")
+                local status=$(get_tpu_status "$zone" "$tpu_name")
+                local dataset_stream="${TPU_TO_STREAM[$tpu_name]}"
+
+                # If TPU is READY and extraction not running, launch it
+                if [ "$status" = "READY" ]; then
+                    # Check if extraction process is running on the TPU
+                    local has_extraction=$(gcloud compute tpus tpu-vm ssh "$tpu_name" \
+                        --zone="$zone" \
+                        --command="pgrep -f 'python.*extract' > /dev/null && echo 'yes' || echo 'no'" 2>/dev/null || echo "no")
+
+                    if [ "$has_extraction" = "no" ]; then
+                        echo -e "${YELLOW}[Extraction] Launching extraction on $tpu_name${NC}"
+
+                        if launch_extraction "$zone" "$tpu_name" "$dataset_stream"; then
+                            EXTRACTION_RUNNING[$tpu_name]=1
+                            echo -e "${GREEN}[Extraction] ✓ Extraction started on $tpu_name${NC}"
+                        else
+                            echo -e "${YELLOW}[Extraction] Failed to launch on $tpu_name, will retry${NC}"
+                        fi
+                    fi
+                else
+                    # TPU not ready, mark extraction as not running
+                    unset EXTRACTION_RUNNING[$tpu_name]
+                fi
+            done
+        done
+
+        sleep "$MONITOR_INTERVAL"
+    done
+}
+
+# Combined monitoring display loop
+function display_loop() {
+    echo -e "${GREEN}[Display] Starting progress display${NC}"
+
+    set +e
+    while true; do
+        display_progress
+        sleep "$MONITOR_INTERVAL"
+    done
+}
+
+# Main orchestrator - runs all loops in parallel
+function monitor_and_manage() {
+    echo -e "${GREEN}=========================================="
+    echo "STARTING DUAL-LOOP MANAGEMENT SYSTEM"
+    echo -e "==========================================${NC}"
+    echo "Monitor interval: ${MONITOR_INTERVAL}s"
+    echo "Loop 1: TPU Lifecycle (creation/recreation)"
+    echo "Loop 2: Extraction Management (launch/relaunch)"
+    echo ""
+    echo "Press Ctrl+C to stop all loops"
+    sleep 3
+
+    # Disable set -e for the entire management system
+    set +e
+
+    # Start TPU lifecycle loop in background
+    tpu_lifecycle_loop &
+    local tpu_loop_pid=$!
+    echo -e "${GREEN}[Main] TPU Lifecycle Loop started (PID: $tpu_loop_pid)${NC}"
+
+    # Start extraction management loop in background
+    extraction_management_loop &
+    local extraction_loop_pid=$!
+    echo -e "${GREEN}[Main] Extraction Management Loop started (PID: $extraction_loop_pid)${NC}"
+
+    # Start display loop in foreground (or background if in nohup mode)
+    display_loop &
+    local display_loop_pid=$!
+    echo -e "${GREEN}[Main] Display Loop started (PID: $display_loop_pid)${NC}"
+
+    # Wait for any loop to exit (they shouldn't, but handle gracefully)
+    wait $tpu_loop_pid $extraction_loop_pid $display_loop_pid
+}
+
+# Step 0: Create TPUs if requested (skipped when using --monitor, as the lifecycle loop handles it)
+if [ "$CREATE_TPUS" = true ] && [ "$MONITOR" = false ]; then
     echo -e "${YELLOW}Step 0: Creating TPUs...${NC}"
     echo ""
 
+    # Disable set -e for TPU creation to handle failures gracefully
+    set +e
     bash "$CODE_DIR/scripts/manage_tpus.sh" create \
         --zones "$ZONES" \
         --workers_per_zone "$WORKERS_PER_ZONE" \
         --tpu_type "$TPU_TYPE"
+    TPU_CREATE_EXIT_CODE=$?
+    set -e
 
-    if [ $? -eq 0 ]; then
+    if [ $TPU_CREATE_EXIT_CODE -eq 0 ]; then
         echo -e "${GREEN}✓ TPUs created${NC}"
     else
-        echo -e "${RED}✗ TPU creation failed${NC}"
-        exit 1
+        echo -e "${YELLOW}⚠ Some TPUs may have failed to create (exit code: $TPU_CREATE_EXIT_CODE)${NC}"
+        echo -e "${YELLOW}  Or manually check TPU status with: bash scripts/manage_tpus.sh status --zones $ZONES${NC}"
     fi
 
     # Wait for TPUs to be ready
     echo ""
     echo "Waiting 30 seconds for TPUs to initialize..."
     sleep 30
+    echo ""
+elif [ "$CREATE_TPUS" = true ] && [ "$MONITOR" = true ]; then
+    echo -e "${YELLOW}Step 0: Skipping initial TPU creation - lifecycle loop will handle it${NC}"
+    echo -e "${CYAN}  The continuous TPU lifecycle loop will create and manage all TPUs${NC}"
     echo ""
 else
     echo -e "${YELLOW}Skipping TPU creation (use --create_tpus to create)${NC}"
@@ -472,9 +576,12 @@ if [ "$SKIP_DATASET" = false ]; then
         DATASET_CMD="$DATASET_CMD --max_samples $MAX_SAMPLES_PER_STREAM"
     fi
 
+    set +e
     eval $DATASET_CMD
+    DATASET_EXIT_CODE=$?
+    set -e
 
-    if [ $? -eq 0 ]; then
+    if [ $DATASET_EXIT_CODE -eq 0 ]; then
         echo -e "${GREEN}✓ Dataset streams created${NC}"
     else
         echo -e "${RED}✗ Dataset preparation failed${NC}"
@@ -484,12 +591,15 @@ if [ "$SKIP_DATASET" = false ]; then
     # Upload to GCS
     echo ""
     echo -e "${YELLOW}Uploading dataset streams to GCS...${NC}"
+    set +e
     bash "$CODE_DIR/scripts/upload_dataset_streams_to_gcs.sh" \
         --bucket "$GCS_BUCKET" \
         --prefix "$GCS_DATASET_PREFIX" \
         --local_dir "$LOCAL_DATASET_DIR"
+    UPLOAD_EXIT_CODE=$?
+    set -e
 
-    if [ $? -eq 0 ]; then
+    if [ $UPLOAD_EXIT_CODE -eq 0 ]; then
         echo -e "${GREEN}✓ Dataset streams uploaded${NC}"
     else
         echo -e "${RED}✗ Upload failed${NC}"
@@ -527,6 +637,7 @@ if [ "$SKIP_LAUNCH" = false ]; then
             fi
 
             # Run setup and extraction script remotely via curl
+            # Use || true to prevent set -e from crashing if TPU not ready
             gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
                 --zone="$zone" \
                 --command="bash <(curl -s https://raw.githubusercontent.com/kathir-ks/activation-extract/main/scripts/run_extraction_worker.sh) \
@@ -536,16 +647,19 @@ if [ "$SKIP_LAUNCH" = false ]; then
                     --gcs_prefix \"$GCS_ACTIVATION_PREFIX\" \
                     --activation_type \"$ACTIVATION_TYPE\" \
                     $MAX_TASKS_ARG \
-                    > ~/extraction.log 2>&1 &" &
+                    > ~/extraction.log 2>&1 &" &>/dev/null &
 
-            ((STREAM_IDX++))
+            STREAM_IDX=$((STREAM_IDX + 1))
             sleep 2  # Stagger starts
         done
 
         echo ""
     done
 
+    # Wait for background SSH commands (ignore failures - monitoring will recover)
+    set +e
     wait
+    set -e
 
     echo -e "${GREEN}✓ Extraction launched on all workers${NC}"
 else
@@ -561,7 +675,7 @@ else
             TPU_TO_STREAM[$TPU_NAME]="$DATASET_STREAM"
             TPU_TO_ZONE[$TPU_NAME]="$zone"
 
-            ((STREAM_IDX++))
+            STREAM_IDX=$((STREAM_IDX + 1))
         done
     done
 fi
@@ -578,12 +692,54 @@ echo ""
 
 # Step 3: Enter monitoring mode if requested
 if [ "$MONITOR" = true ]; then
-    echo -e "${CYAN}Auto-monitoring enabled - entering continuous monitoring mode...${NC}"
-    echo ""
-    sleep 2
+    if [ "$NOHUP" = true ]; then
+        # Run monitoring in background with nohup
+        NOHUP_LOG="$CODE_DIR/monitoring.log"
+        echo -e "${CYAN}Starting monitoring in background with nohup...${NC}"
+        echo "Monitoring log: $NOHUP_LOG"
+        echo ""
 
-    # Start monitoring loop
-    monitor_and_manage
+        # Export all necessary variables and functions for the subshell
+        export GCS_BUCKET GCS_DATASET_PREFIX GCS_ACTIVATION_PREFIX
+        export ZONES WORKERS_PER_ZONE TPU_TYPE MODEL ACTIVATION_TYPE MAX_SAMPLES_PER_STREAM
+        export MONITOR_INTERVAL CODE_DIR
+        export RED GREEN YELLOW BLUE CYAN NC
+        export -f monitor_and_manage get_tpu_name get_tpu_status delete_tpu create_tpu launch_extraction
+        export -f tpu_lifecycle_loop extraction_management_loop display_loop display_progress get_worker_progress get_gcs_shard_count
+
+        # Export associative arrays (bash-specific)
+        declare -p TPU_TO_STREAM > /tmp/tpu_to_stream_$$
+        declare -p TPU_TO_ZONE > /tmp/tpu_to_zone_$$
+
+        # Start monitoring in background
+        nohup bash -c "
+            source /tmp/tpu_to_stream_$$
+            source /tmp/tpu_to_zone_$$
+            monitor_and_manage
+        " > "$NOHUP_LOG" 2>&1 &
+
+        MONITOR_PID=$!
+
+        # Clean up temp files
+        rm -f /tmp/tpu_to_stream_$$ /tmp/tpu_to_zone_$$
+
+        echo -e "${GREEN}✓ Monitoring started in background (PID: $MONITOR_PID)${NC}"
+        echo ""
+        echo "Monitor the log with:"
+        echo "  tail -f $NOHUP_LOG"
+        echo ""
+        echo "Stop monitoring with:"
+        echo "  kill $MONITOR_PID"
+        echo ""
+    else
+        # Run monitoring in foreground
+        echo -e "${CYAN}Auto-monitoring enabled - entering continuous monitoring mode...${NC}"
+        echo ""
+        sleep 2
+
+        # Start monitoring loop
+        monitor_and_manage
+    fi
 else
     # Show manual monitoring commands
     echo "Monitor extraction:"

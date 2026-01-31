@@ -433,7 +433,7 @@ def main():
         num_key_value_heads=hf_config.num_key_value_heads,
         max_position_embeddings=hf_config.max_position_embeddings,
         rms_norm_eps=hf_config.rms_norm_eps,
-        rope_theta=hf_config.rope_theta,
+        rope_theta=getattr(hf_config, 'rope_theta', 1000000.0),
     )
     
     # Default layers to extract

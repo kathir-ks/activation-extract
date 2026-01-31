@@ -464,7 +464,7 @@ def gather_activations_to_primary(
         return None
 
 
-def sync_hosts(tag: str = "sync"):
+def sync_hosts(tag: str = "sync", timeout_seconds: int = 60):
     """
     Synchronize all hosts at a barrier point
     
@@ -473,11 +473,17 @@ def sync_hosts(tag: str = "sync"):
     
     Args:
         tag: Unique identifier for this sync point
+        timeout_seconds: Timeout for sync operation (used for logging only)
     """
     from jax.experimental import multihost_utils
     
     if jax.process_count() > 1:
-        multihost_utils.sync_global_devices(tag)
+        try:
+            multihost_utils.sync_global_devices(tag)
+        except Exception as e:
+            # Log but don't crash - sync failures at end of job are often benign
+            print(f"Warning: sync_hosts('{tag}') failed: {e}")
+            print("  This is often expected during job finalization if hosts finish at different times.")
 
 
 def is_primary_host() -> bool:

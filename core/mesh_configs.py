@@ -58,6 +58,15 @@ TPU_TOPOLOGIES: Dict[str, TopologyConfig] = {
         recommended_batch_size=8,
         recommended_seq_length=2048,
     ),
+    'v5litepod-64': TopologyConfig(
+        name='v5litepod-64',
+        hosts=16,
+        chips_per_host=4,
+        mesh_shape=(16, 4),
+        axis_names=('data', 'model'),
+        recommended_batch_size=64,
+        recommended_seq_length=2048,
+    ),
     'v5e-64': TopologyConfig(
         name='v5e-64',
         hosts=4,
@@ -180,7 +189,8 @@ def create_mesh_for_topology(
     # Create device mesh with specified shape
     device_array = mesh_utils.create_device_mesh(
         config.mesh_shape,
-        devices=devices
+        devices=devices,
+        allow_split_physical_axes=True
     )
     
     mesh = Mesh(device_array, axis_names=config.axis_names)

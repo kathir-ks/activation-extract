@@ -42,7 +42,14 @@ def load_arc_dataset_jsonl(
     tasks = {}
     task_count = 0
 
-    with open(dataset_path, 'r') as f:
+    if dataset_path.startswith("gs://"):
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        f = fs.open(dataset_path, 'r')
+    else:
+        f = open(dataset_path, 'r')
+    
+    with f:
         for line_idx, line in enumerate(f):
             # Shard across machines (round-robin)
             if line_idx % total_machines != machine_id:

@@ -302,6 +302,9 @@ def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
     This function detects multihost configuration from TPU pod environment
     variables set by Google Cloud TPU runtime.
     
+    For TPU pods (v5e-64, etc.), JAX auto-detects the topology without
+    explicit jax.distributed.initialize() call.
+    
     Environment variables checked:
     - TPU_WORKER_HOSTNAMES: Comma-separated list of worker hostnames
     - MEGASCALE_COORDINATOR_ADDRESS: Alternative coordinator address
@@ -325,51 +328,55 @@ def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
         # Try alternative env var
         coordinator_address = os.environ.get('MEGASCALE_COORDINATOR_ADDRESS')
     
-    # Get host ID
+    # Get host ID (default to 0 for single host or JAX auto-detection)
     host_id = int(os.environ.get('TPU_WORKER_ID', 
                    os.environ.get('CLOUD_TPU_TASK_ID', '0')))
     
-    # Get number of hosts
+    # Get number of hosts (default to 1, but JAX will auto-detect for pods)
     num_hosts = int(os.environ.get('TPU_WORKER_COUNT', '1'))
-    
-    # If we have multiple hosts but no coordinator, we're in a pod
-    if num_hosts > 1 and coordinator_address is None:
-        raise RuntimeError(
-            "Multihost environment detected but no coordinator address found. "
-            "Set TPU_WORKER_HOSTNAMES or MEGASCALE_COORDINATOR_ADDRESS"
-        )
     
     if verbose:
         print(f"\n{'='*70}")
         print(f"Multihost Auto-Detection")
         print(f"{'='*70}")
-        print(f"  Host ID: {host_id}")
-        print(f"  Num hosts: {num_hosts}")
+        print(f"  Host ID (from env): {host_id}")
+        print(f"  Num hosts (from env): {num_hosts}")
         print(f"  Coordinator: {coordinator_address}")
     
-    # Initialize if multihost
-    if num_hosts > 1:
+    # For TPU pods, JAX auto-detects without explicit initialize()
+    # Only call jax.distributed.initialize if we have explicit coordinator
+    if coordinator_address and num_hosts > 1:
+        if verbose:
+            print(f"  Calling jax.distributed.initialize() with coordinator...")
         jax.distributed.initialize(
             coordinator_address=coordinator_address,
             num_processes=num_hosts,
             process_id=host_id
         )
-        total_devices = jax.device_count()
     else:
-        total_devices = len(jax.devices())
+        if verbose:
+            print(f"  Letting JAX auto-detect TPU pod topology...")
+    
+    # After initialization (or auto-detection), get actual values from JAX
+    total_devices = jax.device_count()
+    local_devices = jax.local_device_count()
+    actual_host_id = jax.process_index()
+    actual_num_hosts = jax.process_count()
     
     if verbose:
-        print(f"  Local devices: {jax.local_device_count()}")
+        print(f"  JAX process_index(): {actual_host_id}")
+        print(f"  JAX process_count(): {actual_num_hosts}")
+        print(f"  Local devices: {local_devices}")
         print(f"  Total devices: {total_devices}")
         print(f"{'='*70}\n")
     
     return {
-        'host_id': host_id,
-        'num_hosts': num_hosts,
+        'host_id': actual_host_id,
+        'num_hosts': actual_num_hosts,
         'coordinator_address': coordinator_address,
         'total_devices': total_devices,
-        'local_devices': jax.local_device_count(),
-        'is_primary': host_id == 0,
+        'local_devices': local_devices,
+        'is_primary': actual_host_id == 0,
     }
 
 

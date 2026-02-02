@@ -466,6 +466,16 @@ def main():
     params = {'params': converted_params}
     del hf_model  # Free memory
     
+    # CRITICAL: Sync all hosts after model loading
+    # This ensures all hosts have loaded the model before any host starts executing
+    # Without this, hosts that load faster will try to execute while slower hosts
+    # are still loading, causing "unexpected peer in launch group" errors
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"\n⏳ Synchronizing all hosts after model loading...")
+    sync_hosts("model_loaded")
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"✓ All hosts ready")
+    
     # Shard parameters across mesh
     if host_info['is_primary'] and cfg.verbose:
         print(f"\nSharding parameters across {host_info['total_devices']} devices...")

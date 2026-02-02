@@ -17,6 +17,7 @@ import os
 import time
 import socket
 from datetime import datetime
+from functools import partial
 
 # Record start time before any imports
 script_start_time = time.time()
@@ -223,47 +224,58 @@ def test_sharded_jit():
 
 
 def test_psum():
-    """Test 6: All-reduce with psum"""
+    """Test 6: All-reduce with psum using shard_map"""
     print("\n" + "="*60)
-    print("TEST 6: All-Reduce (psum)")
+    print("TEST 6: All-Reduce (psum via shard_map)")
     print("="*60)
+    
+    from jax.experimental.shard_map import shard_map
     
     host_id = jax.process_index()
     num_hosts = jax.process_count()
     devices = jax.devices()
+    num_devices = jax.device_count()
     
     mesh = Mesh(devices, axis_names=('devices',))
     
     try:
-        with mesh:
-            # Each device contributes 1, so total should be num_devices
-            @jax.jit
-            @jax.vmap
-            def local_fn(x):
-                return jax.lax.psum(x, 'devices')
-            
-            # Create input with one 1 per device
-            local_input = jnp.ones((jax.local_device_count(),))
-            
-            # Need to use proper sharding for multihost
-            sharding = NamedSharding(mesh, PartitionSpec('devices'))
-            
-            global_input = jax.make_array_from_single_device_arrays(
-                (jax.device_count(),),
-                sharding,
-                [jax.device_put(local_input[i:i+1], d) for i, d in enumerate(jax.local_devices())]
-            )
-            
-            result = local_fn(global_input)
-            
-            log(f"psum result: {result}")
-            expected = jax.device_count()
-            if jnp.allclose(result, expected):
-                log(f"psum verification PASSED (all values = {expected})")
-                return True
-            else:
-                log(f"psum verification FAILED: expected all {expected}")
-                return False
+        # Create sharded input - each device has value 1.0
+        local_input = jnp.ones((jax.local_device_count(),))
+        sharding = NamedSharding(mesh, PartitionSpec('devices'))
+        
+        global_input = jax.make_array_from_single_device_arrays(
+            (num_devices,),
+            sharding,
+            [jax.device_put(local_input[i:i+1], d) for i, d in enumerate(jax.local_devices())]
+        )
+        
+        log(f"Input shape: {global_input.shape}, sharding: {global_input.sharding}")
+        
+        # Use shard_map for collective operations
+        # Each shard gets a scalar, psum across 'devices' axis
+        @jax.jit
+        @partial(shard_map, mesh=mesh, 
+                 in_specs=(PartitionSpec('devices'),),
+                 out_specs=PartitionSpec('devices'),
+                 check_rep=False)
+        def psum_fn(x):
+            # x is a (1,) array on each device
+            return jax.lax.psum(x, 'devices')
+        
+        result = psum_fn(global_input)
+        
+        log(f"psum result shape: {result.shape}")
+        log(f"psum result (first 4): {result[:4]}")
+        
+        # Each device should now have the sum = num_devices
+        expected = float(num_devices)
+        first_val = float(result[0])
+        if abs(first_val - expected) < 0.01:
+            log(f"psum verification PASSED (all values = {expected})")
+            return True
+        else:
+            log(f"psum verification FAILED: got {first_val}, expected {expected}")
+            return False
                 
     except Exception as e:
         log(f"psum FAILED: {e}")

@@ -82,6 +82,15 @@ from arc24.data_augmentation import set_random_seed
 from arc24.encoders import create_grid_encoder
 from core.dataset_utils import create_prompts_from_dataset
 
+# Import barrier synchronization for multihost coordination
+from core.barrier_sync import (
+    init_barrier_sync,
+    barrier,
+    shutdown_barrier_sync,
+    BarrierServer,
+    BarrierClient,
+)
+
 
 @dataclass
 class MultihostExtractionConfig:
@@ -127,6 +136,11 @@ class MultihostExtractionConfig:
     # Checkpointing
     enable_checkpointing: bool = True
     checkpoint_dir: str = './checkpoints'
+    
+    # Barrier synchronization for multihost coordination
+    enable_barrier_sync: bool = True  # Enable socket-based barrier sync
+    barrier_port: int = 5555
+    barrier_controller_host: Optional[str] = None  # Auto-detected if None
     
     # Other
     random_seed: Optional[int] = 42
@@ -327,6 +341,16 @@ def main():
     parser.add_argument('--no_checkpointing', action='store_false', dest='enable_checkpointing')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
     
+    # Barrier sync args
+    parser.add_argument('--enable_barrier_sync', action='store_true', default=True,
+                        help="Enable socket-based barrier synchronization (default: True)")
+    parser.add_argument('--no_barrier_sync', action='store_false', dest='enable_barrier_sync',
+                        help="Disable socket-based barrier synchronization")
+    parser.add_argument('--barrier_port', type=int, default=5555,
+                        help="Port for barrier server (default: 5555)")
+    parser.add_argument('--barrier_controller_host', type=str,
+                        help="Barrier controller host (default: auto-detect Worker 0 IP)")
+    
     # Other args
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--verbose', action='store_true', default=True)
@@ -372,6 +396,33 @@ def main():
         print("=" * 70)
         print(json.dumps(asdict(cfg), indent=2, default=str))
         print("=" * 70)
+    
+    # =========================================================================
+    # Step 1b: Initialize barrier synchronization (if enabled)
+    # =========================================================================
+    
+    barrier_server = None
+    barrier_client = None
+    
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"\n🔗 Initializing barrier synchronization...")
+        
+        barrier_server, barrier_client = init_barrier_sync(
+            num_workers=host_info['num_hosts'],
+            controller_host=cfg.barrier_controller_host,
+            port=cfg.barrier_port
+        )
+        
+        # First barrier: ensure all workers are connected before proceeding
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"  ⏳ Waiting for all {host_info['num_hosts']} hosts at 'init' barrier...")
+        
+        if not barrier("init", timeout=300):
+            raise RuntimeError("Failed to synchronize at 'init' barrier")
+            
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"  ✓ All hosts synchronized!")
     
     # =========================================================================
     # Step 2: Create device mesh for topology
@@ -466,13 +517,19 @@ def main():
     params = {'params': converted_params}
     del hf_model  # Free memory
     
-    # CRITICAL: Sync all hosts after model loading
+    # CRITICAL: Sync all hosts after model loading using socket barrier
     # This ensures all hosts have loaded the model before any host starts executing
     # Without this, hosts that load faster will try to execute while slower hosts
     # are still loading, causing "unexpected peer in launch group" errors
     if host_info['is_primary'] and cfg.verbose:
         print(f"\n⏳ Synchronizing all hosts after model loading...")
-    sync_hosts("model_loaded")
+    
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        if not barrier("model_loaded", timeout=600):  # 10 min for large models
+            raise RuntimeError("Failed to synchronize at 'model_loaded' barrier")
+    else:
+        sync_hosts("model_loaded")
+        
     if host_info['is_primary'] and cfg.verbose:
         print(f"✓ All hosts ready")
     
@@ -484,7 +541,11 @@ def main():
     with mesh:
         params = shard_params(params, sharding_strategy)
     
-    sync_hosts("model_loaded")
+    # Sync after sharding
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        barrier("sharding_complete", timeout=300)
+    else:
+        sync_hosts("model_loaded")
     
     # =========================================================================
     # Step 6: Create prompts and tokenize
@@ -547,6 +608,19 @@ def main():
     per_host_batch = cfg.batch_size // host_info['num_hosts']
     num_batches = (len(sequences) + cfg.batch_size - 1) // cfg.batch_size
     
+    # CRITICAL: Sync before extraction starts
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"\n⏳ Synchronizing hosts before extraction...")
+    
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        if not barrier("extraction_start", timeout=300):
+            raise RuntimeError("Failed to synchronize at 'extraction_start' barrier")
+    else:
+        sync_hosts("extraction_start")
+    
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"✓ All hosts synchronized, starting extraction!")
+    
     last_saved_shard_count = 0
     
     with mesh:
@@ -605,9 +679,13 @@ def main():
     
     storage.finalize()
     
-    # Save final checkpoint
+    # Save final checkpoint with barrier sync
     if cfg.enable_checkpointing:
-        sync_hosts("final_checkpoint")
+        if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+            barrier("final_checkpoint", timeout=300)
+        else:
+            sync_hosts("final_checkpoint")
+        
         final_checkpoint = {
             'topology': cfg.topology,
             'last_processed_sample_idx': len(sequences) - 1,
@@ -619,8 +697,12 @@ def main():
         }
         save_checkpoint_multihost(cfg.checkpoint_dir, cfg.topology, final_checkpoint)
     
-    # Final sync and summary
-    sync_hosts("complete")
+    # Final sync using barrier
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        barrier("complete", timeout=300)
+        shutdown_barrier_sync()
+    else:
+        sync_hosts("complete")
     
     if host_info['is_primary']:
         print("\n" + "=" * 70)

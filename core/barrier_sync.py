@@ -375,19 +375,28 @@ _barrier_server: Optional[BarrierServer] = None
 def init_barrier_sync(
     num_workers: Optional[int] = None,
     controller_host: Optional[str] = None,
-    port: int = 5555
+    port: int = 5555,
+    worker_id: Optional[int] = None
 ) -> tuple[Optional[BarrierServer], BarrierClient]:
     """
     Initialize barrier synchronization.
     
     Worker 0 starts the server, all workers create clients.
     
+    Args:
+        num_workers: Number of workers (auto-detected if None)
+        controller_host: IP of worker 0 running the barrier server
+        port: Port for barrier server
+        worker_id: Explicit worker ID (auto-detected if None, required for TPUs
+                   where env vars may not be set before JAX init)
+    
     Returns:
         Tuple of (server, client) - server is None for non-zero workers
     """
     global _barrier_server, _barrier_client
     
-    worker_id = get_worker_id()
+    if worker_id is None:
+        worker_id = get_worker_id()
     
     if num_workers is None:
         num_workers = get_num_workers()
@@ -395,13 +404,18 @@ def init_barrier_sync(
     if controller_host is None:
         controller_host = get_worker0_internal_ip()
     
+    logger.info(f"init_barrier_sync: worker_id={worker_id}, num_workers={num_workers}")
+    
     server = None
     
     # Worker 0 starts the server
     if worker_id == 0:
+        logger.info(f"Worker {worker_id} starting barrier server on port {port}...")
         server = BarrierServer(num_workers=num_workers, port=port)
         server.start_background(wait_ready=True, ready_timeout=30.0)
         _barrier_server = server
+    else:
+        logger.info(f"Worker {worker_id} will connect to barrier server at {controller_host}:{port}")
     
     # All workers create a client
     client = BarrierClient(

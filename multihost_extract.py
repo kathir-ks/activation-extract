@@ -411,7 +411,8 @@ def main():
         barrier_server, barrier_client = init_barrier_sync(
             num_workers=host_info['num_hosts'],
             controller_host=cfg.barrier_controller_host,
-            port=cfg.barrier_port
+            port=cfg.barrier_port,
+            worker_id=host_info['host_id']  # Use detected host_id, not auto-detection
         )
         
         # First barrier: ensure all workers are connected before proceeding

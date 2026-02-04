@@ -498,6 +498,21 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, trust_remote_code=True)
     
+    # CRITICAL: Sync before model download
+    # Model downloading from HuggingFace can take varying times on different hosts
+    # Without this barrier, hosts will drift apart during download/loading
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"\n⏳ Synchronizing hosts before model download...")
+    
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        if not barrier("pre_model_download", timeout=300):
+            raise RuntimeError("Failed to synchronize at 'pre_model_download' barrier")
+    else:
+        sync_hosts("pre_model_download")
+        
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"✓ All hosts ready, starting model download...")
+    
     # Load HF model and convert (all hosts do this)
     hf_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_path,

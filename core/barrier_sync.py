@@ -43,8 +43,8 @@ class BarrierConfig:
     """Configuration for barrier synchronization"""
     port: int = 5555
     timeout: int = 300  # 5 minutes
-    retry_attempts: int = 5
-    retry_delay: float = 2.0
+    retry_attempts: int = 10  # Increased for SSH timing differences
+    retry_delay: float = 3.0  # Increased initial delay
     buffer_size: int = 1024
 
 

@@ -71,6 +71,7 @@ class BarrierServer:
         self._server_thread: Optional[threading.Thread] = None
         self._running = False
         self._shutdown_event = threading.Event()
+        self._ready_event = threading.Event()  # Signal when server is ready
         
         # Track barrier state
         self._current_barrier: Optional[str] = None
@@ -82,12 +83,23 @@ class BarrierServer:
         self._running = True
         self._run_server()
         
-    def start_background(self):
-        """Start the barrier server in a background thread"""
+    def start_background(self, wait_ready: bool = True, ready_timeout: float = 10.0):
+        """Start the barrier server in a background thread
+        
+        Args:
+            wait_ready: If True, wait for server to be ready before returning
+            ready_timeout: How long to wait for server to be ready
+        """
         self._running = True
         self._server_thread = threading.Thread(target=self._run_server, daemon=True)
         self._server_thread.start()
-        logger.info(f"Barrier server started on {self.host}:{self.port}")
+        
+        # Wait for server to be ready (socket bound and listening)
+        if wait_ready:
+            if self._ready_event.wait(timeout=ready_timeout):
+                logger.info(f"Barrier server ready on {self.host}:{self.port}")
+            else:
+                raise RuntimeError(f"Barrier server failed to start within {ready_timeout}s")
         
     def stop(self):
         """Stop the barrier server"""
@@ -115,6 +127,9 @@ class BarrierServer:
             self._server_socket.bind((self.host, self.port))
             self._server_socket.listen(self.num_workers * 2)
             logger.info(f"Barrier server listening on {self.host}:{self.port}")
+            
+            # Signal that server is ready
+            self._ready_event.set()
             
             while self._running and not self._shutdown_event.is_set():
                 try:
@@ -385,11 +400,8 @@ def init_barrier_sync(
     # Worker 0 starts the server
     if worker_id == 0:
         server = BarrierServer(num_workers=num_workers, port=port)
-        server.start_background()
+        server.start_background(wait_ready=True, ready_timeout=30.0)
         _barrier_server = server
-        
-        # Give server time to start
-        time.sleep(0.5)
     
     # All workers create a client
     client = BarrierClient(

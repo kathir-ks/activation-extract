@@ -141,6 +141,7 @@ class MultihostExtractionConfig:
     enable_barrier_sync: bool = True  # Enable socket-based barrier sync
     barrier_port: int = 5555
     barrier_controller_host: Optional[str] = None  # Auto-detected if None
+    is_barrier_server: bool = False  # Set to True for SSH worker 0 only
     
     # Other
     random_seed: Optional[int] = 42

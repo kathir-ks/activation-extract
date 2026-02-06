@@ -350,6 +350,8 @@ def main():
                         help="Port for barrier server (default: 5555)")
     parser.add_argument('--barrier_controller_host', type=str,
                         help="Barrier controller host (default: auto-detect Worker 0 IP)")
+    parser.add_argument('--is_barrier_server', action='store_true', default=False,
+                        help="This worker should run the barrier server (set for SSH worker 0 only)")
     
     # Other args
     parser.add_argument('--random_seed', type=int, default=42)
@@ -362,7 +364,49 @@ def main():
     cfg = MultihostExtractionConfig(**config_dict)
     
     # =========================================================================
-    # Step 1: Initialize multihost environment
+    # Step 0: Start barrier server BEFORE JAX init (if this is the server worker)
+    # =========================================================================
+    # The barrier server must start before JAX's distributed init because SSH workers
+    # connect at different times and we need to synchronize them BEFORE JAX tries
+    # to form a process group.
+    
+    from core.barrier_sync import BarrierServer, BarrierClient
+    
+    barrier_server = None
+    barrier_client = None
+    
+    if cfg.enable_barrier_sync and args.is_barrier_server:
+        # This is the designated barrier server (SSH worker 0)
+        print(f"\n🚀 Starting barrier server on port {cfg.barrier_port}...")
+        barrier_server = BarrierServer(num_workers=16, port=cfg.barrier_port)  # Default to 16 workers
+        barrier_server.start_background(wait_ready=True, ready_timeout=30.0)
+        print(f"✓ Barrier server ready on port {cfg.barrier_port}")
+    
+    # All workers create barrier client and wait at 'pre_jax_init' barrier
+    if cfg.enable_barrier_sync and cfg.barrier_controller_host:
+        # Give server a moment to start (important for timing)
+        import time
+        time.sleep(2.0)  # Small delay for all non-server workers
+        
+        barrier_client = BarrierClient(
+            controller_host=cfg.barrier_controller_host,
+            worker_id=0 if args.is_barrier_server else 1,  # Server is worker 0
+            port=cfg.barrier_port
+        )
+        
+        # Set the global client for the barrier() convenience function
+        from core import barrier_sync
+        barrier_sync._barrier_client = barrier_client
+        if barrier_server:
+            barrier_sync._barrier_server = barrier_server
+        
+        print(f"⏳ Waiting at 'pre_jax_init' barrier...")
+        if not barrier_client.wait_at_barrier("pre_jax_init", timeout=300):
+            raise RuntimeError("Failed to synchronize at 'pre_jax_init' barrier")
+        print(f"✓ Synchronized! Starting JAX init...")
+    
+    # =========================================================================
+    # Step 1: Initialize multihost environment (NOW all workers start together)
     # =========================================================================
     
     if cfg.coordinator_address and cfg.host_id is not None and cfg.num_hosts:
@@ -396,34 +440,6 @@ def main():
         print("=" * 70)
         print(json.dumps(asdict(cfg), indent=2, default=str))
         print("=" * 70)
-    
-    # =========================================================================
-    # Step 1b: Initialize barrier synchronization (if enabled)
-    # =========================================================================
-    
-    barrier_server = None
-    barrier_client = None
-    
-    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-        if host_info['is_primary'] and cfg.verbose:
-            print(f"\n🔗 Initializing barrier synchronization...")
-        
-        barrier_server, barrier_client = init_barrier_sync(
-            num_workers=host_info['num_hosts'],
-            controller_host=cfg.barrier_controller_host,
-            port=cfg.barrier_port,
-            worker_id=host_info['host_id']  # Use detected host_id, not auto-detection
-        )
-        
-        # First barrier: ensure all workers are connected before proceeding
-        if host_info['is_primary'] and cfg.verbose:
-            print(f"  ⏳ Waiting for all {host_info['num_hosts']} hosts at 'init' barrier...")
-        
-        if not barrier("init", timeout=300):
-            raise RuntimeError("Failed to synchronize at 'init' barrier")
-            
-        if host_info['is_primary'] and cfg.verbose:
-            print(f"  ✓ All hosts synchronized!")
     
     # =========================================================================
     # Step 2: Create device mesh for topology

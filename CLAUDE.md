@@ -86,14 +86,100 @@ Three extraction modes available via `--activation_type`:
 
 | File | Purpose |
 |------|---------|
-| [extract_activations.py](extract_activations.py) | Main extraction script (current) |
+| [extract_activations.py](extract_activations.py) | Single-host extraction script |
+| [multihost_extract.py](multihost_extract.py) | **Multi-host TPU extraction (v5litepod-64)** |
 | [qwen2_jax.py](qwen2_jax.py) | JAX implementation of Qwen 2.5 |
 | [qwen2_jax_with_hooks.py](qwen2_jax_with_hooks.py) | Model with activation hooks |
 | [core/activation_storage.py](core/activation_storage.py) | Shard storage and GCS upload |
 | [core/dataset_utils.py](core/dataset_utils.py) | Dataset loading utilities |
 | [core/jax_utils.py](core/jax_utils.py) | JAX/TPU utilities (mesh, sharding) |
+| [core/barrier_sync.py](core/barrier_sync.py) | **Socket-based barrier synchronization** |
 | [scripts/manage_tpus.sh](scripts/manage_tpus.sh) | TPU lifecycle management |
+| [scripts/launch_multihost_sync.sh](scripts/launch_multihost_sync.sh) | Launch multihost extraction with barrier sync |
 | [create_dataset_streams.py](create_dataset_streams.py) | Create per-worker dataset streams |
+
+## Multihost TPU Architecture (v5litepod-64)
+
+The multihost extraction system handles TPU pods with 16 workers (4 TPU chips each):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TPU Pod (v5litepod-64)                        │
+│                                                                  │
+│  ┌─────────┐  ┌─────────┐      ┌─────────┐  ┌─────────┐        │
+│  │Worker 0 │  │Worker 1 │ ...  │Worker 14│  │Worker 15│        │
+│  │ 4 chips │  │ 4 chips │      │ 4 chips │  │ 4 chips │        │
+│  └────┬────┘  └────┬────┘      └────┬────┘  └────┬────┘        │
+│       │            │                 │            │              │
+│       ▼            ▼                 ▼            ▼              │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │            Barrier Sync Server (Worker 0)             │       │
+│  │   Coordinates all workers at synchronization points   │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                              │                                   │
+│       ┌──────────────────────┼──────────────────────┐           │
+│       ▼                      ▼                      ▼           │
+│  ┌─────────┐           ┌─────────┐           ┌─────────┐       │
+│  │  init   │──────────▶│ model   │──────────▶│  start  │       │
+│  │ barrier │           │ loaded  │           │ extract │       │
+│  └─────────┘           └─────────┘           └─────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Socket Barrier Synchronization
+
+The barrier sync system ([core/barrier_sync.py](core/barrier_sync.py)) solves the problem of staggered SSH connections causing "unexpected peer in launch group" JAX errors:
+
+```python
+# Barrier sync points in multihost_extract.py:
+# 1. init             - After JAX initialization  
+# 2. model_loaded     - After model weights loaded
+# 3. sharding_complete - After parameters sharded
+# 4. extraction_start  - Before processing batches
+# 5. final_checkpoint  - After last batch
+# 6. complete          - Before shutdown
+```
+
+**How it works:**
+1. Worker 0 starts a TCP barrier server
+2. All workers connect as clients
+3. At each barrier point, workers wait until ALL workers arrive
+4. Server releases all workers simultaneously
+
+### Running Multihost Extraction
+
+```bash
+# From control machine, SSH to all workers:
+gcloud compute tpus tpu-vm ssh TPU_NAME --zone=ZONE --worker=all \
+    --command="cd ~/activation-extract && python3 multihost_extract.py \
+        --topology v5litepod-64 \
+        --dataset_path gs://bucket/datasets/stream.jsonl \
+        --gcs_bucket bucket \
+        --gcs_prefix activations/run_001 \
+        --batch_size 32 \
+        --upload_to_gcs \
+        --enable_barrier_sync \
+        --barrier_controller_host WORKER_0_IP \
+        --barrier_port 5555"
+```
+
+### Current Status (Feb 2026)
+
+**Working:**
+- Single-host extraction on v5-8, v5e-8
+- Model loading and weight conversion
+- Activation extraction and GCS upload
+- Checkpoint/resume system
+
+**In Progress:**
+- Multihost extraction on v5litepod-64
+- Socket barrier synchronization to fix JAX peer sync issues
+- Issue: Workers detect host_id from JAX process_index() after JAX init, but barrier sync needs to know which worker is "worker 0" to start the server
+
+**Known Issues:**
+- JAX's process_index() not available before distributed initialization
+- SSH timing causes workers to start at different times
+- Need to determine worker 0 IP before JAX init for barrier server
 
 ## Running Extraction
 

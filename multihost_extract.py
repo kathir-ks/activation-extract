@@ -371,11 +371,12 @@ def main():
     # connect at different times and we need to synchronize them BEFORE JAX tries
     # to form a process group.
     
-    from core.barrier_sync import BarrierServer, BarrierClient, get_worker_id
+    from core.barrier_sync import BarrierServer, BarrierClient, get_worker_id, get_worker0_internal_ip
     
     # Detect worker ID from environment (BEFORE any JAX initialization)
     # CRITICAL: This must happen before any JAX imports or distributed init
     # Google Cloud sets CLOUD_TPU_TASK_ID automatically when using --worker=all
+    # GCE metadata agent-worker-number is the most reliable source for TPU VMs
     worker_id = get_worker_id()
     is_barrier_server = (worker_id == 0)
     
@@ -384,9 +385,17 @@ def main():
         is_barrier_server = True
         worker_id = 0
     
+    # Auto-detect barrier controller host if not provided
+    barrier_controller_host = cfg.barrier_controller_host
+    if cfg.enable_barrier_sync and not barrier_controller_host:
+        barrier_controller_host = get_worker0_internal_ip()
+        if cfg.verbose:
+            print(f"   Auto-detected barrier controller: {barrier_controller_host}")
+    
     if cfg.verbose:
         print(f"\n📋 Worker ID: {worker_id}")
         print(f"   Is barrier server: {is_barrier_server}")
+        print(f"   Barrier controller: {barrier_controller_host}")
     
     barrier_server = None
     barrier_client = None
@@ -399,13 +408,13 @@ def main():
         print(f"✓ Barrier server ready on port {cfg.barrier_port}")
     
     # All workers create barrier client and wait at 'pre_jax_init' barrier
-    if cfg.enable_barrier_sync and cfg.barrier_controller_host:
+    if cfg.enable_barrier_sync and barrier_controller_host:
         # Give server a moment to start (important for timing)
         import time
         time.sleep(2.0)  # Small delay for all non-server workers
         
         barrier_client = BarrierClient(
-            controller_host=cfg.barrier_controller_host,
+            controller_host=barrier_controller_host,
             worker_id=worker_id,  # Use detected worker ID from environment
             port=cfg.barrier_port
         )

@@ -260,6 +260,12 @@ def process_batch_multihost(
     # Forward pass (JIT-compiled, SPMD across all hosts)
     activations = extract_activations_sharded(model, params, input_ids)
     
+    # CRITICAL: Synchronize all workers before collective gather operation
+    # This prevents "unexpected peer in launch group" errors by ensuring
+    # all workers are ready for allgather at the same time
+    from core.barrier_sync import barrier
+    barrier("pre_gather")
+    
     # Gather activations to primary host
     gathered_activations = gather_activations_to_primary(activations)
     

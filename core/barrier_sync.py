@@ -169,11 +169,12 @@ class BarrierServer:
             barrier_name = parts[1]
             worker_id = parts[2]
             
-            logger.info(f"Worker {worker_id} reached barrier '{barrier_name}'")
+            logger.info(f"Worker {worker_id} from {addr} reached barrier '{barrier_name}'")
             
             # Register worker and wait
+            # Use connection address for unique key (worker_id may not be unique before JAX init)
             with self._barrier_lock:
-                key = f"{barrier_name}:{worker_id}"
+                key = f"{barrier_name}:{addr[0]}:{addr[1]}"  # Use IP:port as unique key
                 self._connected_workers[key] = conn
                 
                 # Check if all workers have reached this barrier
@@ -329,19 +330,29 @@ def get_worker0_internal_ip() -> str:
 
 
 def get_worker_id() -> int:
-    """Get the current worker ID from environment"""
-    # Cloud TPU environment variables
-    for var in ['TPU_WORKER_ID', 'CLOUD_TPU_TASK_ID', 'MEGASCALE_SLICE_ID']:
-        if var in os.environ:
-            return int(os.environ[var])
+    """Get the current worker ID from environment (BEFORE JAX init)
     
-    # Fallback: use JAX process index if available
+    Prioritizes CLOUD_TPU_TASK_ID as it's automatically set by 
+    gcloud ssh --worker=all, making it the most reliable source.
+    """
+    # Cloud TPU environment variables - prioritize CLOUD_TPU_TASK_ID
+    # as it's automatically set by gcloud ssh --worker=all
+    for var in ['CLOUD_TPU_TASK_ID', 'TPU_WORKER_ID', 'MEGASCALE_SLICE_ID']:
+        if var in os.environ:
+            worker_id = int(os.environ[var])
+            logger.info(f"Detected worker_id={worker_id} from {var}")
+            return worker_id
+    
+    # Fallback: use JAX process index if available (only after JAX init)
     try:
         import jax
-        return jax.process_index()
+        worker_id = jax.process_index()
+        logger.info(f"Detected worker_id={worker_id} from jax.process_index()")
+        return worker_id
     except:
         pass
     
+    logger.warning("No worker ID found in environment, defaulting to 0")
     return 0
 
 

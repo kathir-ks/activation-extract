@@ -352,7 +352,7 @@ def main():
     parser.add_argument('--barrier_controller_host', type=str,
                         help="Barrier controller host (default: auto-detect Worker 0 IP)")
     parser.add_argument('--is_barrier_server', action='store_true', default=False,
-                        help="This worker should run the barrier server (set for SSH worker 0 only)")
+                        help="Override: Force this worker to run the barrier server (auto-detected from CLOUD_TPU_TASK_ID if not set)")
     
     # Other args
     parser.add_argument('--random_seed', type=int, default=42)
@@ -371,12 +371,27 @@ def main():
     # connect at different times and we need to synchronize them BEFORE JAX tries
     # to form a process group.
     
-    from core.barrier_sync import BarrierServer, BarrierClient
+    from core.barrier_sync import BarrierServer, BarrierClient, get_worker_id
+    
+    # Detect worker ID from environment (BEFORE any JAX initialization)
+    # CRITICAL: This must happen before any JAX imports or distributed init
+    # Google Cloud sets CLOUD_TPU_TASK_ID automatically when using --worker=all
+    worker_id = get_worker_id()
+    is_barrier_server = (worker_id == 0)
+    
+    # Allow explicit override via CLI flag (for manual setups)
+    if args.is_barrier_server:
+        is_barrier_server = True
+        worker_id = 0
+    
+    if cfg.verbose:
+        print(f"\n📋 Worker ID: {worker_id}")
+        print(f"   Is barrier server: {is_barrier_server}")
     
     barrier_server = None
     barrier_client = None
     
-    if cfg.enable_barrier_sync and args.is_barrier_server:
+    if cfg.enable_barrier_sync and is_barrier_server:
         # This is the designated barrier server (SSH worker 0)
         print(f"\n🚀 Starting barrier server on port {cfg.barrier_port}...")
         barrier_server = BarrierServer(num_workers=16, port=cfg.barrier_port)  # Default to 16 workers
@@ -391,7 +406,7 @@ def main():
         
         barrier_client = BarrierClient(
             controller_host=cfg.barrier_controller_host,
-            worker_id=0 if args.is_barrier_server else 1,  # Server is worker 0
+            worker_id=worker_id,  # Use detected worker ID from environment
             port=cfg.barrier_port
         )
         

@@ -167,19 +167,22 @@ gcloud compute tpus tpu-vm ssh TPU_NAME --zone=ZONE --worker=all \
 
 **Working:**
 - Single-host extraction on v5-8, v5e-8
-- Model loading and weight conversion
+- Model loading and weight conversion  
 - Activation extraction and GCS upload
 - Checkpoint/resume system
+- Socket barrier synchronization with auto-detection of worker 0
 
-**In Progress:**
+**Ready for Testing:**
 - Multihost extraction on v5litepod-64
-- Socket barrier synchronization to fix JAX peer sync issues
-- Issue: Workers detect host_id from JAX process_index() after JAX init, but barrier sync needs to know which worker is "worker 0" to start the server
+- Barrier synchronization to fix JAX peer sync issues
+
+**Fixed (Feb 7, 2026):**
+- ✅ Worker 0 detection now uses `CLOUD_TPU_TASK_ID` environment variable  
+- ✅ Barrier server auto-starts on worker 0 before JAX initialization
+- ✅ No manual `--is_barrier_server` flag needed when using `--worker=all`
 
 **Known Issues:**
-- JAX's process_index() not available before distributed initialization
-- SSH timing causes workers to start at different times
-- Need to determine worker 0 IP before JAX init for barrier server
+- None currently - ready for TPU pod testing
 
 ## Running Extraction
 

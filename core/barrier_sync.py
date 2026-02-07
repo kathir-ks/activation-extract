@@ -312,36 +312,59 @@ def get_worker0_internal_ip() -> str:
         if hosts:
             return hosts[0].strip()
     
-    # Fallback: try to get from metadata
+    # Try to get from GCE metadata - worker-network-endpoints contains all worker IPs
     try:
         import subprocess
         result = subprocess.run(
             ['curl', '-s', '-H', 'Metadata-Flavor: Google',
-             'http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip'],
+             'http://metadata.google.internal/computeMetadata/v1/instance/attributes/worker-network-endpoints'],
             capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except:
-        pass
+        if result.returncode == 0 and result.stdout.strip():
+            # Format: unknown:unknown:IP,unknown:unknown:IP,...
+            # First IP is worker 0
+            endpoints = result.stdout.strip()
+            first_endpoint = endpoints.split(',')[0]
+            ip = first_endpoint.split(':')[-1]  # Get last part (the IP)
+            logger.info(f"Detected worker 0 IP from metadata: {ip}")
+            return ip
+    except Exception as e:
+        logger.debug(f"Failed to get worker IPs from metadata: {e}")
     
     # Final fallback: localhost (single-host testing)
     return '127.0.0.1'
 
 
 def get_worker_id() -> int:
-    """Get the current worker ID from environment (BEFORE JAX init)
+    """Get the current worker ID from environment or GCE metadata (BEFORE JAX init)
     
-    Prioritizes CLOUD_TPU_TASK_ID as it's automatically set by 
-    gcloud ssh --worker=all, making it the most reliable source.
+    Checks in order:
+    1. Environment variables (CLOUD_TPU_TASK_ID, TPU_WORKER_ID)
+    2. GCE instance metadata (agent-worker-number)
+    3. JAX process_index() if already initialized
+    4. Default to 0
     """
-    # Cloud TPU environment variables - prioritize CLOUD_TPU_TASK_ID
-    # as it's automatically set by gcloud ssh --worker=all
+    # Cloud TPU environment variables
     for var in ['CLOUD_TPU_TASK_ID', 'TPU_WORKER_ID', 'MEGASCALE_SLICE_ID']:
         if var in os.environ:
             worker_id = int(os.environ[var])
             logger.info(f"Detected worker_id={worker_id} from {var}")
             return worker_id
+    
+    # Try GCE instance metadata - this is the most reliable for TPU VMs
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['curl', '-s', '-H', 'Metadata-Flavor: Google',
+             'http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            worker_id = int(result.stdout.strip())
+            logger.info(f"Detected worker_id={worker_id} from GCE metadata (agent-worker-number)")
+            return worker_id
+    except Exception as e:
+        logger.debug(f"Failed to get worker ID from metadata: {e}")
     
     # Fallback: use JAX process index if available (only after JAX init)
     try:
@@ -352,12 +375,12 @@ def get_worker_id() -> int:
     except:
         pass
     
-    logger.warning("No worker ID found in environment, defaulting to 0")
+    logger.warning("No worker ID found, defaulting to 0")
     return 0
 
 
 def get_num_workers() -> int:
-    """Get the number of workers from environment"""
+    """Get the number of workers from environment or GCE metadata"""
     # Cloud TPU environment variables
     for var in ['TPU_WORKER_COUNT', 'MEGASCALE_NUM_SLICES']:
         if var in os.environ:
@@ -367,6 +390,21 @@ def get_num_workers() -> int:
     hostnames = os.environ.get('TPU_WORKER_HOSTNAMES', '')
     if hostnames:
         return len(hostnames.split(','))
+    
+    # Try GCE metadata - count worker endpoints
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['curl', '-s', '-H', 'Metadata-Flavor: Google',
+             'http://metadata.google.internal/computeMetadata/v1/instance/attributes/worker-network-endpoints'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            num_workers = len(result.stdout.strip().split(','))
+            logger.info(f"Detected num_workers={num_workers} from GCE metadata")
+            return num_workers
+    except Exception as e:
+        logger.debug(f"Failed to get worker count from metadata: {e}")
     
     # Fallback: use JAX process count if available
     try:

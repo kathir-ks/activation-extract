@@ -297,26 +297,36 @@ def get_device_memory_info() -> Dict[str, float]:
 
 def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
     """
-    Auto-initialize JAX distributed from environment variables
+    Auto-initialize JAX distributed from environment variables or GCE metadata
     
     This function detects multihost configuration from TPU pod environment
-    variables set by Google Cloud TPU runtime.
+    variables set by Google Cloud TPU runtime, or from GCE instance metadata.
     
-    For TPU pods (v5e-64, etc.), JAX auto-detects the topology without
-    explicit jax.distributed.initialize() call.
-    
-    Environment variables checked:
-    - TPU_WORKER_HOSTNAMES: Comma-separated list of worker hostnames
-    - MEGASCALE_COORDINATOR_ADDRESS: Alternative coordinator address
-    - TPU_WORKER_ID / CLOUD_TPU_TASK_ID: This host's ID
-    - TPU_WORKER_COUNT: Total number of hosts
+    Detection order:
+    1. Environment variables (TPU_WORKER_HOSTNAMES, TPU_WORKER_ID, etc.)
+    2. GCE instance metadata (worker-network-endpoints, agent-worker-number)
     
     Returns:
         Dict with host_id, num_hosts, coordinator_address, total_devices
     """
     import os
+    import subprocess
     
-    # Try to get coordinator address
+    def get_metadata(path):
+        """Fetch metadata from GCE metadata server"""
+        try:
+            result = subprocess.run(
+                ['curl', '-s', '-H', 'Metadata-Flavor: Google',
+                 f'http://metadata.google.internal/computeMetadata/v1/instance/attributes/{path}'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+        return None
+    
+    # Try to get coordinator address from environment first
     coordinator_address = None
     hostnames = os.environ.get('TPU_WORKER_HOSTNAMES', '')
     
@@ -328,26 +338,57 @@ def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
         # Try alternative env var
         coordinator_address = os.environ.get('MEGASCALE_COORDINATOR_ADDRESS')
     
-    # Get host ID (default to 0 for single host or JAX auto-detection)
-    host_id = int(os.environ.get('TPU_WORKER_ID', 
-                   os.environ.get('CLOUD_TPU_TASK_ID', '0')))
+    # If no coordinator from env, try GCE metadata
+    if not coordinator_address:
+        worker_endpoints = get_metadata('worker-network-endpoints')
+        if worker_endpoints:
+            # Format: unknown:unknown:IP,unknown:unknown:IP,...
+            first_endpoint = worker_endpoints.split(',')[0]
+            first_ip = first_endpoint.split(':')[-1]
+            coordinator_address = f"{first_ip}:8476"
     
-    # Get number of hosts (default to 1, but JAX will auto-detect for pods)
-    num_hosts = int(os.environ.get('TPU_WORKER_COUNT', '1'))
+    # Get host ID - try env vars first, then metadata
+    host_id = None
+    for var in ['TPU_WORKER_ID', 'CLOUD_TPU_TASK_ID']:
+        if var in os.environ:
+            host_id = int(os.environ[var])
+            break
+    
+    if host_id is None:
+        # Try GCE metadata
+        worker_number = get_metadata('agent-worker-number')
+        if worker_number and worker_number.isdigit():
+            host_id = int(worker_number)
+        else:
+            host_id = 0
+    
+    # Get number of hosts - try env vars first, then metadata
+    num_hosts = None
+    if 'TPU_WORKER_COUNT' in os.environ:
+        num_hosts = int(os.environ['TPU_WORKER_COUNT'])
+    elif hostnames:
+        num_hosts = len(hostnames.split(','))
+    
+    if num_hosts is None:
+        # Try GCE metadata - count worker endpoints
+        worker_endpoints = get_metadata('worker-network-endpoints')
+        if worker_endpoints:
+            num_hosts = len(worker_endpoints.split(','))
+        else:
+            num_hosts = 1
     
     if verbose:
         print(f"\n{'='*70}")
         print(f"Multihost Auto-Detection")
         print(f"{'='*70}")
-        print(f"  Host ID (from env): {host_id}")
-        print(f"  Num hosts (from env): {num_hosts}")
+        print(f"  Host ID: {host_id}")
+        print(f"  Num hosts: {num_hosts}")
         print(f"  Coordinator: {coordinator_address}")
     
-    # For TPU pods, JAX auto-detects without explicit initialize()
-    # Only call jax.distributed.initialize if we have explicit coordinator
+    # For multihost setups, initialize JAX distributed
     if coordinator_address and num_hosts > 1:
         if verbose:
-            print(f"  Calling jax.distributed.initialize() with coordinator...")
+            print(f"  Calling jax.distributed.initialize()...")
         jax.distributed.initialize(
             coordinator_address=coordinator_address,
             num_processes=num_hosts,
@@ -355,9 +396,9 @@ def initialize_multihost_auto(verbose: bool = False) -> Dict[str, any]:
         )
     else:
         if verbose:
-            print(f"  Letting JAX auto-detect TPU pod topology...")
+            print(f"  Letting JAX auto-detect topology...")
     
-    # After initialization (or auto-detection), get actual values from JAX
+    # After initialization, get actual values from JAX
     total_devices = jax.device_count()
     local_devices = jax.local_device_count()
     actual_host_id = jax.process_index()

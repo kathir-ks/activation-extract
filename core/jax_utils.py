@@ -10,6 +10,7 @@ This module provides utilities for:
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import jit
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental import mesh_utils
@@ -64,63 +65,87 @@ def initialize_multihost(
     return jax.device_count()
 
 
-def create_device_mesh(mesh_type: str = '2d', verbose: bool = False) -> Mesh:
+def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
     """
     Create device mesh for sharded computation
-
+    
+    Supports single-host and multi-host configurations:
+    - Single-host: 1D mesh with 'model' axis
+    - Multi-host: 3D mesh with (data, fsdp, model) axes for FSDP
+    
     Args:
-        mesh_type: Type of mesh - '1d', '2d', or '3d'
+        mesh_type: 'auto', '1d', '2d', or '3d'
+                   'auto' selects 1D for single-host, 3D for multi-host
         verbose: Print mesh info
-
+    
     Returns:
         JAX Mesh object
     """
     devices = jax.devices()
-    num_devices = len(devices)
-
+    num_local_devices = len(devices)
+    num_hosts = jax.process_count()
+    total_devices = jax.device_count()
+    
+    # Auto-select mesh type based on host count
+    if mesh_type == 'auto':
+        mesh_type = '1d' if num_hosts == 1 else '3d'
+    
     if mesh_type == '1d':
-        # Simple 1D mesh along 'model' axis
-        mesh = Mesh(devices, axis_names=('model',))
-
+        # Single-host: 1D mesh along 'model' axis
+        mesh = Mesh(np.array(devices), axis_names=('model',))
+    
     elif mesh_type == '2d':
         # 2D mesh: (data, model)
-        # For v5e-64: 4 hosts × 8 chips = 32 devices
-        # Can reshape as (4, 8) or (8, 4) etc.
-
-        # Try to create balanced 2D mesh
-        if num_devices == 32:
-            # v5e-64: 4 data parallel × 8 model parallel
-            device_array = mesh_utils.create_device_mesh((4, 8), devices)
+        if num_hosts > 1:
+            # Multi-host: data=hosts, model=local_devices
+            device_array = mesh_utils.create_device_mesh(
+                (num_hosts, num_local_devices), 
+                devices=None  # Let JAX auto-arrange
+            )
             mesh = Mesh(device_array, axis_names=('data', 'model'))
         else:
-            # Generic: try to balance
+            # Single-host: try to balance
             import math
-            sqrt = int(math.sqrt(num_devices))
-            if sqrt * sqrt == num_devices:
+            sqrt = int(math.sqrt(num_local_devices))
+            if sqrt * sqrt == num_local_devices:
                 device_array = mesh_utils.create_device_mesh((sqrt, sqrt), devices)
             else:
-                # Fallback: (1, num_devices)
-                device_array = mesh_utils.create_device_mesh((1, num_devices), devices)
+                device_array = mesh_utils.create_device_mesh((1, num_local_devices), devices)
             mesh = Mesh(device_array, axis_names=('data', 'model'))
-
+    
     elif mesh_type == '3d':
-        # 3D mesh: (data, fsdp, model)
-        # For advanced sharding strategies
-        if num_devices == 32:
-            device_array = mesh_utils.create_device_mesh((2, 4, 4), devices)
+        # 3D mesh: (data, fsdp, model) for FSDP
+        if num_hosts > 1:
+            # Multi-host FSDP:
+            # data = num_hosts (batch parallelism across hosts)  
+            # fsdp = 2 (parameter sharding within host)
+            # model = local_devices // 2 (tensor parallelism)
+            fsdp_size = min(2, num_local_devices)
+            model_size = num_local_devices // fsdp_size
+            
+            device_array = mesh_utils.create_device_mesh(
+                (num_hosts, fsdp_size, model_size),
+                devices=None  # Let JAX handle multihost device ordering
+            )
             mesh = Mesh(device_array, axis_names=('data', 'fsdp', 'model'))
         else:
-            raise ValueError(f"3D mesh not supported for {num_devices} devices")
+            # Single-host: fsdp and model only
+            fsdp_size = min(2, num_local_devices)
+            model_size = num_local_devices // fsdp_size
+            device_array = mesh_utils.create_device_mesh((fsdp_size, model_size), devices)
+            mesh = Mesh(device_array, axis_names=('fsdp', 'model'))
     else:
         raise ValueError(f"Unknown mesh_type: {mesh_type}")
-
+    
     if verbose:
         print(f"\nDevice Mesh Created:")
         print(f"  Type: {mesh_type.upper()}")
         print(f"  Shape: {mesh.shape}")
         print(f"  Axes: {mesh.axis_names}")
-        print(f"  Devices: {num_devices}\n")
-
+        print(f"  Local devices: {num_local_devices}")
+        print(f"  Total devices: {total_devices}")
+        print(f"  Hosts: {num_hosts}\n")
+    
     return mesh
 
 
@@ -134,14 +159,28 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
     Returns:
         Dictionary of NamedSharding objects for different parameter types
     """
-    if 'data' in mesh.axis_names and 'model' in mesh.axis_names:
+    if 'fsdp' in mesh.axis_names:
+        # 3D mesh: (data, fsdp, model)
+        # data: Batch parallelism
+        # fsdp: Parameter sharding
+        # model: Tensor parallelism
+        return {
+            'weights': NamedSharding(mesh, P('fsdp', 'model')),  # Shard outer dim on fsdp, inner on model
+            'embed': NamedSharding(mesh, P('fsdp', None)),       # Shard vocab on fsdp
+            'bias': NamedSharding(mesh, P('model')),             # Shard bias on model
+            'layernorm': NamedSharding(mesh, P(None)),           # Replicated
+            'replicated': NamedSharding(mesh, P(None, None, None)),
+            'input': NamedSharding(mesh, P('data', None)),       # Input batch sharded on data axis
+        }
+    elif 'data' in mesh.axis_names and 'model' in mesh.axis_names:
         # 2D mesh: shard along model axis
         return {
             'weights': NamedSharding(mesh, P(None, 'model')),  # (hidden, model_dim) sharded
             'embed': NamedSharding(mesh, P('model', None)),    # (vocab, hidden) sharded
             'bias': NamedSharding(mesh, P('model')),           # (hidden,) sharded
             'layernorm': NamedSharding(mesh, P(None)),         # Replicated
-            'replicated': NamedSharding(mesh, P(None, None))   # Fully replicated
+            'replicated': NamedSharding(mesh, P(None, None)),   # Fully replicated
+            'input': NamedSharding(mesh, P('data', None)),     # Input batch sharded on data axis
         }
     elif 'model' in mesh.axis_names:
         # 1D mesh: shard along model axis
@@ -150,7 +189,8 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
             'embed': NamedSharding(mesh, P('model', None)),
             'bias': NamedSharding(mesh, P('model')),
             'layernorm': NamedSharding(mesh, P(None)),
-            'replicated': NamedSharding(mesh, P(None))
+            'replicated': NamedSharding(mesh, P(None)),
+            'input': NamedSharding(mesh, P(None, None)),       # Replicated input
         }
     else:
         # 3D or other: default to replication
@@ -159,7 +199,8 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
             'embed': NamedSharding(mesh, P(None, None)),
             'bias': NamedSharding(mesh, P(None)),
             'layernorm': NamedSharding(mesh, P(None)),
-            'replicated': NamedSharding(mesh, P(None))
+            'replicated': NamedSharding(mesh, P(None)),
+            'input': NamedSharding(mesh, P(None)),
         }
 
 
@@ -190,9 +231,9 @@ def shard_params(params: Dict, sharding_strategy: Dict[str, NamedSharding]) -> D
     # Recursively shard nested parameters
     def shard_tree(tree, prefix=''):
         if isinstance(tree, dict):
-            return {k: shard_tree(v, f"{prefix}.{k}" if prefix else k)
+            return {k: shard_tree(v, f"{prefix}.{k}" if prefix else k) 
                    for k, v in tree.items()}
-        elif isinstance(tree, jnp.ndarray):
+        elif hasattr(tree, 'shape'):  # Handle both numpy and jax arrays
             return shard_array(tree, prefix)
         else:
             return tree

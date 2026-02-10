@@ -31,6 +31,7 @@ Usage:
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding
 import json
 import numpy as np
 import argparse
@@ -244,6 +245,8 @@ def process_batch_multihost(
     batch_size: int,
     max_seq_length: int,
     host_info: Dict,
+    mesh: Optional[Mesh] = None,
+    sharding_specs: Optional[Dict[str, NamedSharding]] = None,
 ):
     """Process a batch of sequences with multihost coordination"""
     
@@ -257,6 +260,11 @@ def process_batch_multihost(
     padded = pad_sequences(sequences, pad_token_id=pad_token_id, fixed_length=max_seq_length)
     input_ids = jnp.array(padded)
     
+    # Shard input_ids along batch dimension if mesh is provided (FSDP)
+    if mesh is not None and sharding_specs is not None and 'input' in sharding_specs:
+        # FSDP: All workers hold a slice of the batch
+        input_ids = jax.device_put(input_ids, sharding_specs['input'])
+    
     # Forward pass (JIT-compiled, SPMD across all hosts)
     activations = extract_activations_sharded(model, params, input_ids)
     
@@ -267,7 +275,14 @@ def process_batch_multihost(
     barrier("pre_gather")
     
     # Gather activations to primary host
-    gathered_activations = gather_activations_to_primary(activations)
+    if mesh is not None and sharding_specs is not None:
+        # FSDP: Activations are already global (sharded across hosts)
+        # Primary host can access directly (JAX fetches remote data)
+        # Non-primary hosts: return None to avoid duplicate work
+        gathered_activations = activations if host_info['is_primary'] else None
+    else:
+        # Legacy/Local: Explicitly gather from all hosts
+        gathered_activations = gather_activations_to_primary(activations)
     
     # Only primary host stores activations
     if gathered_activations is not None:
@@ -370,6 +385,9 @@ def main():
     config_dict = {k: v for k, v in vars(args).items() if v is not None}
     cfg = MultihostExtractionConfig(**config_dict)
     
+    # Validate batch size is divisible by number of hosts (required for FSDP)
+    # Note: num_hosts may not be known yet, validation will happen after initialization
+    
     # =========================================================================
     # Step 0: Start barrier server BEFORE JAX init (if this is the server worker)
     # =========================================================================
@@ -377,39 +395,41 @@ def main():
     # connect at different times and we need to synchronize them BEFORE JAX tries
     # to form a process group.
     
-    from core.barrier_sync import BarrierServer, BarrierClient, get_worker_id, get_worker0_internal_ip
-    
+    from core.barrier_sync import BarrierServer, BarrierClient, get_worker_id, get_worker0_internal_ip, get_num_workers
+
     # Detect worker ID from environment (BEFORE any JAX initialization)
     # CRITICAL: This must happen before any JAX imports or distributed init
     # Google Cloud sets CLOUD_TPU_TASK_ID automatically when using --worker=all
     # GCE metadata agent-worker-number is the most reliable source for TPU VMs
     worker_id = get_worker_id()
     is_barrier_server = (worker_id == 0)
-    
+
     # Allow explicit override via CLI flag (for manual setups)
     if args.is_barrier_server:
         is_barrier_server = True
         worker_id = 0
-    
+
     # Auto-detect barrier controller host if not provided
     barrier_controller_host = cfg.barrier_controller_host
     if cfg.enable_barrier_sync and not barrier_controller_host:
         barrier_controller_host = get_worker0_internal_ip()
         if cfg.verbose:
             print(f"   Auto-detected barrier controller: {barrier_controller_host}")
-    
+
     if cfg.verbose:
         print(f"\n📋 Worker ID: {worker_id}")
         print(f"   Is barrier server: {is_barrier_server}")
         print(f"   Barrier controller: {barrier_controller_host}")
-    
+
     barrier_server = None
     barrier_client = None
-    
+
     if cfg.enable_barrier_sync and is_barrier_server:
         # This is the designated barrier server (SSH worker 0)
-        print(f"\n🚀 Starting barrier server on port {cfg.barrier_port}...")
-        barrier_server = BarrierServer(num_workers=16, port=cfg.barrier_port)  # Default to 16 workers
+        # Detect number of workers from environment before JAX init
+        num_workers = get_num_workers()
+        print(f"\n🚀 Starting barrier server on port {cfg.barrier_port} for {num_workers} workers...")
+        barrier_server = BarrierServer(num_workers=num_workers, port=cfg.barrier_port)
         barrier_server.start_background(wait_ready=True, ready_timeout=30.0)
         print(f"✓ Barrier server ready on port {cfg.barrier_port}")
     
@@ -472,13 +492,20 @@ def main():
         print(json.dumps(asdict(cfg), indent=2, default=str))
         print("=" * 70)
     
+    # Validate batch size is divisible by number of hosts (required for FSDP)
+    if cfg.batch_size % host_info['num_hosts'] != 0:
+        raise ValueError(
+            f"Batch size ({cfg.batch_size}) must be divisible by number of hosts ({host_info['num_hosts']}) for FSDP. "
+            f"Try batch_size={cfg.batch_size + (host_info['num_hosts'] - cfg.batch_size % host_info['num_hosts'])}"
+        )
+    
     # =========================================================================
     # Step 2: Create device mesh for topology
     # =========================================================================
     
-    topology_config = get_topology_config(cfg.topology)
-    mesh = create_mesh_for_topology(cfg.topology, verbose=host_info['is_primary'] and cfg.verbose)
-    sharding_specs = create_sharding_specs(mesh, topology_config)
+    # Use auto-detected mesh (1D for single-host, 3D for multi-host)
+    mesh = create_device_mesh('auto', verbose=host_info['is_primary'] and cfg.verbose)
+    sharding_specs = create_sharding_strategy(mesh)
     
     # =========================================================================
     # Step 3: Load checkpoint if exists
@@ -701,22 +728,24 @@ def main():
             if global_end <= start_sample_idx:
                 continue
             
-            # Get this host's portion of the batch
-            host_start = global_start + host_info['host_id'] * per_host_batch
-            host_end = min(host_start + per_host_batch, global_end)
+            # FSDP: All workers process the FULL batch, but sharded
+            # We no longer slice the batch manually per worker
+            host_start = global_start
+            host_end = global_end
             
-            if host_start >= len(sequences):
-                continue
-            
-            batch_sequences = sequences[host_start:host_end]
-            batch_sample_indices = list(range(host_start, host_end))
+            # Everyone gets same batch - JAX handles sharding
+            batch_sequences = sequences[global_start:global_end]
+            batch_sample_indices = list(range(global_start, global_end))
             
             process_batch_multihost(
                 jax_model, params, batch_sequences, batch_sample_indices,
                 prompts_data, storage, cfg.layers_to_extract,
                 tokenizer.pad_token_id or 0,
-                per_host_batch, cfg.max_seq_length,
-                host_info
+                cfg.batch_size,  # Use global batch size
+                cfg.max_seq_length,
+                host_info,
+                mesh=mesh,
+                sharding_specs=sharding_specs
             )
             
             # Checkpoint after shard creation (primary host only)

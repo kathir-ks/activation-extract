@@ -118,16 +118,28 @@ def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
         if num_hosts > 1:
             # Multi-host FSDP:
             # data = num_hosts (batch parallelism across hosts)  
-            # fsdp = 2 (parameter sharding within host)
-            # model = local_devices // 2 (tensor parallelism)
+            # fsdp = devices per host (parameter sharding within host)
+            # For v5e pods, the physical torus is [8,8,1]
+            # We use allow_split_physical_axes to map arbitrary logical shapes
             fsdp_size = min(2, num_local_devices)
             model_size = num_local_devices // fsdp_size
             
-            device_array = mesh_utils.create_device_mesh(
-                (num_hosts, fsdp_size, model_size),
-                devices=None  # Let JAX handle multihost device ordering
-            )
-            mesh = Mesh(device_array, axis_names=('data', 'fsdp', 'model'))
+            try:
+                device_array = mesh_utils.create_device_mesh(
+                    (num_hosts, fsdp_size, model_size),
+                    devices=None,
+                    allow_split_physical_axes=True
+                )
+                mesh = Mesh(device_array, axis_names=('data', 'fsdp', 'model'))
+            except (NotImplementedError, ValueError):
+                # Fallback: 2D mesh (data, fsdp) - simpler but still enables FSDP
+                print(f"  Warning: 3D mesh failed, falling back to 2D mesh (data={num_hosts}, fsdp={num_local_devices})")
+                device_array = mesh_utils.create_device_mesh(
+                    (num_hosts, num_local_devices),
+                    devices=None,
+                    allow_split_physical_axes=True
+                )
+                mesh = Mesh(device_array, axis_names=('data', 'fsdp'))
         else:
             # Single-host: fsdp and model only
             fsdp_size = min(2, num_local_devices)
@@ -159,7 +171,7 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
     Returns:
         Dictionary of NamedSharding objects for different parameter types
     """
-    if 'fsdp' in mesh.axis_names:
+    if 'fsdp' in mesh.axis_names and 'model' in mesh.axis_names:
         # 3D mesh: (data, fsdp, model)
         # data: Batch parallelism
         # fsdp: Parameter sharding
@@ -171,6 +183,18 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
             'layernorm': NamedSharding(mesh, P(None)),           # Replicated
             'replicated': NamedSharding(mesh, P(None, None, None)),
             'input': NamedSharding(mesh, P('data', None)),       # Input batch sharded on data axis
+        }
+    elif 'fsdp' in mesh.axis_names and 'data' in mesh.axis_names:
+        # 2D FSDP mesh: (data, fsdp) - fallback when 3D doesn't map to physical topology
+        # data: Batch parallelism across hosts
+        # fsdp: Parameter sharding within host
+        return {
+            'weights': NamedSharding(mesh, P('fsdp', None)),   # Shard outer dim on fsdp
+            'embed': NamedSharding(mesh, P('fsdp', None)),     # Shard vocab on fsdp
+            'bias': NamedSharding(mesh, P('fsdp')),            # Shard bias on fsdp
+            'layernorm': NamedSharding(mesh, P(None)),         # Replicated
+            'replicated': NamedSharding(mesh, P(None, None)),  # Fully replicated
+            'input': NamedSharding(mesh, P('data', None)),     # Input batch sharded on data axis
         }
     elif 'data' in mesh.axis_names and 'model' in mesh.axis_names:
         # 2D mesh: shard along model axis

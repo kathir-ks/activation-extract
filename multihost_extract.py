@@ -267,22 +267,11 @@ def process_batch_multihost(
     
     # Forward pass (JIT-compiled, SPMD across all hosts)
     activations = extract_activations_sharded(model, params, input_ids)
-    
-    # CRITICAL: Synchronize all workers before collective gather operation
-    # This prevents "unexpected peer in launch group" errors by ensuring
-    # all workers are ready for allgather at the same time
-    from core.barrier_sync import barrier
-    barrier("pre_gather")
-    
-    # Gather activations to primary host
-    if mesh is not None and sharding_specs is not None:
-        # FSDP: Activations are already global (sharded across hosts)
-        # Primary host can access directly (JAX fetches remote data)
-        # Non-primary hosts: return None to avoid duplicate work
-        gathered_activations = activations if host_info['is_primary'] else None
-    else:
-        # Legacy/Local: Explicitly gather from all hosts
-        gathered_activations = gather_activations_to_primary(activations)
+
+    # Gather activations from all hosts to primary host
+    # JAX SPMD already synchronizes workers - no explicit barrier needed
+    # gather_activations_to_primary() uses process_allgather internally
+    gathered_activations = gather_activations_to_primary(activations)
     
     # Only primary host stores activations
     if gathered_activations is not None:

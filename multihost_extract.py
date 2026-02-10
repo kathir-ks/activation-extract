@@ -274,34 +274,35 @@ def process_batch_multihost(
     from core.barrier_sync import barrier
     barrier("pre_gather")
     
-    # Gather activations to primary host
+    # In FSDP mode, each host has its own addressable shard of the activations.
+    # Each host stores its own portion independently (no need for global gather).
     if mesh is not None and sharding_specs is not None:
-        # FSDP: Activations are already global (sharded across hosts)
-        # Primary host can access directly (JAX fetches remote data)
-        # Non-primary hosts: return None to avoid duplicate work
-        gathered_activations = activations if host_info['is_primary'] else None
-    else:
-        # Legacy/Local: Explicitly gather from all hosts
-        gathered_activations = gather_activations_to_primary(activations)
-    
-    # Only primary host stores activations
-    if gathered_activations is not None:
-        # Async device→host transfer for all layers
+        # FSDP: Each host processes its own addressable shard
         host_activations = {}
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
-            if layer_key in gathered_activations:
-                host_activations[layer_key] = jax.device_get(gathered_activations[layer_key])
+            if layer_key in activations:
+                # Get only the data addressable by this host
+                local_shards = activations[layer_key].addressable_shards
+                # Concatenate local shard data into a single numpy array
+                local_data = np.concatenate([np.array(s.data) for s in local_shards], axis=0)
+                host_activations[layer_key] = local_data
         
-        # Process only actual samples
-        for i, sample_idx in enumerate(sample_indices):
-            if i >= actual_batch_size:
-                break  # Skip padding samples
+        # Each host stores its portion of the batch
+        # In FSDP, host_start:host_end covers the local batch portion
+        per_host_samples = actual_batch_size // host_info['num_hosts']
+        local_start = host_info['host_id'] * per_host_samples
+        local_end = min(local_start + per_host_samples, actual_batch_size)
+        
+        for i_local, global_i in enumerate(range(local_start, local_end)):
+            if global_i >= len(sample_indices):
+                break
+            sample_idx = sample_indices[global_i]
             prompt_data = prompts_data[sample_idx]
             for layer_idx in layers_to_extract:
                 layer_key = f'layer_{layer_idx}'
                 if layer_key in host_activations:
-                    layer_act = host_activations[layer_key][i]
+                    layer_act = host_activations[layer_key][i_local]
                     layer_act_np = np.array(layer_act)
                     storage.add_activation(
                         layer_idx=layer_idx,
@@ -309,6 +310,33 @@ def process_batch_multihost(
                         sample_idx=sample_idx,
                         text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
                     )
+    else:
+        # Legacy/Local: Explicitly gather from all hosts
+        gathered_activations = gather_activations_to_primary(activations)
+        
+        # Only primary host stores activations
+        if gathered_activations is not None:
+            host_activations = {}
+            for layer_idx in layers_to_extract:
+                layer_key = f'layer_{layer_idx}'
+                if layer_key in gathered_activations:
+                    host_activations[layer_key] = jax.device_get(gathered_activations[layer_key])
+            
+            for i, sample_idx in enumerate(sample_indices):
+                if i >= actual_batch_size:
+                    break
+                prompt_data = prompts_data[sample_idx]
+                for layer_idx in layers_to_extract:
+                    layer_key = f'layer_{layer_idx}'
+                    if layer_key in host_activations:
+                        layer_act = host_activations[layer_key][i]
+                        layer_act_np = np.array(layer_act)
+                        storage.add_activation(
+                            layer_idx=layer_idx,
+                            activation=layer_act_np,
+                            sample_idx=sample_idx,
+                            text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
+                        )
 
 
 def main():

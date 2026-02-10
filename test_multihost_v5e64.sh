@@ -22,6 +22,15 @@ echo "Dataset: $DATASET_PATH"
 echo "Max tasks: $MAX_TASKS"
 echo ""
 
+# Clean up stale processes from previous runs
+echo "Cleaning up stale processes on all workers..."
+gcloud compute tpus tpu-vm ssh $TPU_NAME \
+    --zone=$ZONE \
+    --worker=all \
+    --command="pkill -f 'python3.*multihost_extract' 2>/dev/null; sleep 1; fuser -k 5555/tcp 2>/dev/null; echo 'Worker cleaned'" 2>/dev/null || true
+echo "Waiting for TPU lockfiles to release..."
+sleep 5
+
 # Run on all workers
 gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \

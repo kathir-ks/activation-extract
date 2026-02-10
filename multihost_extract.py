@@ -158,50 +158,42 @@ class MultihostExtractionConfig:
 
 class MultihostActivationStorage(ActivationStorage):
     """
-    Storage handler for multihost TPU extraction
-    
-    Key differences:
-    - Only primary host (host 0) uploads to GCS
-    - Activations are gathered from all hosts before storage
-    - Checkpoints are synchronized across hosts
+    Storage handler for multihost TPU extraction.
+
+    With FSDP, each host holds a shard of the activations. Every host
+    runs its own ActivationStorage instance and uploads to a per-host
+    GCS prefix (e.g. activations/host_00/, activations/host_01/).
+
+    This avoids expensive cross-host gathers and lets each host stream
+    its data to GCS independently.
     """
-    
+
     def __init__(
         self,
         host_id: int = 0,
         num_hosts: int = 1,
         **kwargs
     ):
-        # Initialize parent only on primary host
         self.host_id = host_id
         self.num_hosts = num_hosts
         self.is_primary = (host_id == 0)
-        
-        if self.is_primary:
-            super().__init__(**kwargs)
-        else:
-            # Non-primary hosts don't need storage
-            self.shard_count = 0
-            self.verbose = kwargs.get('verbose', False)
-    
-    def add_activation(
-        self,
-        layer_idx: int,
-        activation: np.ndarray,
-        sample_idx: int,
-        text_preview: str = ""
-    ):
-        """Add activation (only on primary host)"""
-        if self.is_primary:
-            super().add_activation(layer_idx, activation, sample_idx, text_preview)
-    
+
+        # Each host gets its own output_dir and gcs_prefix
+        if num_hosts > 1:
+            output_dir = kwargs.get('output_dir', './activations')
+            kwargs['output_dir'] = os.path.join(output_dir, f'host_{host_id:02d}')
+
+            gcs_prefix = kwargs.get('gcs_prefix', 'activations')
+            kwargs['gcs_prefix'] = f"{gcs_prefix}/host_{host_id:02d}"
+
+        # All hosts initialize storage (each writes its own shards)
+        super().__init__(**kwargs)
+
     def finalize(self):
-        """Finalize with proper multihost synchronization"""
-        # Barrier to ensure all hosts finished processing
+        """Finalize storage, then sync all hosts"""
+        super().finalize()
+        # Sync after all hosts have flushed their buffers
         sync_hosts("finalize_storage")
-        
-        if self.is_primary:
-            super().finalize()
 
 
 def load_checkpoint_multihost(checkpoint_dir: str, topology: str) -> Dict:
@@ -266,34 +258,27 @@ def process_batch_multihost(
         input_ids = jax.device_put(input_ids, sharding_specs['input'])
     
     # Forward pass (JIT-compiled, SPMD across all hosts)
+    # JAX SPMD already synchronizes workers - no explicit barrier needed
     activations = extract_activations_sharded(model, params, input_ids)
-    
-    # CRITICAL: Synchronize all workers before collective gather operation
-    # This prevents "unexpected peer in launch group" errors by ensuring
-    # all workers are ready for allgather at the same time
-    from core.barrier_sync import barrier
-    barrier("pre_gather")
-    
-    # In FSDP mode, each host has its own addressable shard of the activations.
-    # Each host stores its own portion independently (no need for global gather).
+
+    # ── FSDP path: each host extracts its own addressable shard ──────
     if mesh is not None and sharding_specs is not None:
-        # FSDP: Each host processes its own addressable shard
+        # Transfer this host's addressable shards to numpy
         host_activations = {}
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
             if layer_key in activations:
-                # Get only the data addressable by this host
                 local_shards = activations[layer_key].addressable_shards
-                # Concatenate local shard data into a single numpy array
-                local_data = np.concatenate([np.array(s.data) for s in local_shards], axis=0)
+                local_data = np.concatenate(
+                    [np.array(s.data) for s in local_shards], axis=0
+                )
                 host_activations[layer_key] = local_data
-        
-        # Each host stores its portion of the batch
-        # In FSDP, host_start:host_end covers the local batch portion
+
+        # Map local shard rows back to global sample indices
         per_host_samples = actual_batch_size // host_info['num_hosts']
         local_start = host_info['host_id'] * per_host_samples
         local_end = min(local_start + per_host_samples, actual_batch_size)
-        
+
         for i_local, global_i in enumerate(range(local_start, local_end)):
             if global_i >= len(sample_indices):
                 break
@@ -302,26 +287,26 @@ def process_batch_multihost(
             for layer_idx in layers_to_extract:
                 layer_key = f'layer_{layer_idx}'
                 if layer_key in host_activations:
-                    layer_act = host_activations[layer_key][i_local]
-                    layer_act_np = np.array(layer_act)
                     storage.add_activation(
                         layer_idx=layer_idx,
-                        activation=layer_act_np,
+                        activation=host_activations[layer_key][i_local],
                         sample_idx=sample_idx,
                         text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
                     )
+
+    # ── Legacy / single-host path: gather to primary ─────────────────
     else:
-        # Legacy/Local: Explicitly gather from all hosts
         gathered_activations = gather_activations_to_primary(activations)
-        
-        # Only primary host stores activations
+
         if gathered_activations is not None:
             host_activations = {}
             for layer_idx in layers_to_extract:
                 layer_key = f'layer_{layer_idx}'
                 if layer_key in gathered_activations:
-                    host_activations[layer_key] = jax.device_get(gathered_activations[layer_key])
-            
+                    host_activations[layer_key] = jax.device_get(
+                        gathered_activations[layer_key]
+                    )
+
             for i, sample_idx in enumerate(sample_indices):
                 if i >= actual_batch_size:
                     break
@@ -329,11 +314,9 @@ def process_batch_multihost(
                 for layer_idx in layers_to_extract:
                     layer_key = f'layer_{layer_idx}'
                     if layer_key in host_activations:
-                        layer_act = host_activations[layer_key][i]
-                        layer_act_np = np.array(layer_act)
                         storage.add_activation(
                             layer_idx=layer_idx,
-                            activation=layer_act_np,
+                            activation=np.array(host_activations[layer_key][i]),
                             sample_idx=sample_idx,
                             text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
                         )
@@ -663,7 +646,7 @@ def main():
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
         barrier("sharding_complete", timeout=300)
     else:
-        sync_hosts("model_loaded")
+        sync_hosts("sharding_complete")
     
     # =========================================================================
     # Step 6: Create prompts and tokenize

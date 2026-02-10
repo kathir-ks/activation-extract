@@ -196,12 +196,12 @@ class MultihostActivationStorage(ActivationStorage):
         sync_hosts("finalize_storage")
 
 
-def load_checkpoint_multihost(checkpoint_dir: str, topology: str) -> Dict:
-    """Load checkpoint file if exists (only on primary host)"""
-    if not is_primary_host():
-        return {}
-    
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_multihost_{topology}.json")
+def load_checkpoint_multihost(checkpoint_dir: str, topology: str, host_id: int) -> Dict:
+    """Load checkpoint file for this host if it exists"""
+    checkpoint_path = os.path.join(
+        checkpoint_dir,
+        f"checkpoint_{topology}_host_{host_id:02d}.json"
+    )
     if os.path.exists(checkpoint_path):
         try:
             with open(checkpoint_path, 'r') as f:
@@ -209,20 +209,6 @@ def load_checkpoint_multihost(checkpoint_dir: str, topology: str) -> Dict:
         except Exception as e:
             print(f"Warning: Failed to load checkpoint: {e}")
     return {}
-
-
-def save_checkpoint_multihost(checkpoint_dir: str, topology: str, data: Dict):
-    """Save checkpoint file (only on primary host)"""
-    if not is_primary_host():
-        return
-    
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_multihost_{topology}.json")
-    try:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        with open(checkpoint_path, 'w') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"Warning: Failed to save checkpoint: {e}")
 
 
 def process_batch_multihost(
@@ -524,14 +510,17 @@ def main():
     
     start_sample_idx = 0
     if cfg.enable_checkpointing:
-        checkpoint = load_checkpoint_multihost(cfg.checkpoint_dir, cfg.topology)
-        if checkpoint and host_info['is_primary']:
+        checkpoint = load_checkpoint_multihost(
+            cfg.checkpoint_dir, cfg.topology, host_info['host_id']
+        )
+        if checkpoint:
             start_sample_idx = checkpoint.get('last_processed_sample_idx', 0) + 1
-            print(f"\n📌 RESUMING FROM CHECKPOINT")
-            print(f"  Last processed sample: {checkpoint.get('last_processed_sample_idx', 0)}")
-            print(f"  Starting from sample: {start_sample_idx}")
-    
-    # Broadcast start_sample_idx to all hosts
+            if host_info['is_primary']:
+                print(f"\n📌 RESUMING FROM CHECKPOINT (Host {host_info['host_id']})")
+                print(f"  Last processed sample: {checkpoint.get('last_processed_sample_idx', 0)}")
+                print(f"  Starting from sample: {start_sample_idx}")
+
+    # Sync after checkpoint loading
     sync_hosts("checkpoint_loaded")
     
     # =========================================================================
@@ -672,12 +661,12 @@ def main():
     sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
     
     # =========================================================================
-    # Step 7: Initialize storage (primary host only)
+    # Step 7: Initialize storage (each host writes its own shards)
     # =========================================================================
-    
+
     # Update GCS prefix with topology info
     gcs_prefix = f"{cfg.gcs_prefix}_{cfg.topology}"
-    
+
     storage = MultihostActivationStorage(
         host_id=host_info['host_id'],
         num_hosts=host_info['num_hosts'],
@@ -688,7 +677,7 @@ def main():
         shard_size_gb=cfg.shard_size_gb,
         compress_shards=cfg.compress_shards,
         delete_local_after_upload=cfg.delete_local_after_upload,
-        verbose=host_info['is_primary'] and cfg.verbose
+        verbose=cfg.verbose
     )
     
     # =========================================================================
@@ -759,20 +748,28 @@ def main():
                 sharding_specs=sharding_specs
             )
             
-            # Checkpoint after shard creation (primary host only)
+            # Checkpoint after shard creation (each host saves independently)
             if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
-                sync_hosts(f"checkpoint_{batch_idx}")
                 checkpoint_data = {
                     'topology': cfg.topology,
+                    'host_id': host_info['host_id'],
                     'last_processed_sample_idx': global_end - 1,
                     'total_samples_processed': global_end,
                     'total_shards': storage.shard_count,
                     'dataset_path': cfg.dataset_path,
                     'model_path': cfg.model_path,
                 }
-                save_checkpoint_multihost(cfg.checkpoint_dir, cfg.topology, checkpoint_data)
+                # Each host saves its own checkpoint
+                checkpoint_path = os.path.join(
+                    cfg.checkpoint_dir,
+                    f"checkpoint_{cfg.topology}_host_{host_info['host_id']:02d}.json"
+                )
+                os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+                with open(checkpoint_path, 'w') as f:
+                    json.dump(checkpoint_data, f, indent=2)
+
                 last_saved_shard_count = storage.shard_count
-                
+
                 if host_info['is_primary'] and cfg.verbose:
                     pbar.set_postfix({'shards': storage.shard_count})
     
@@ -782,15 +779,11 @@ def main():
     
     storage.finalize()
     
-    # Save final checkpoint with barrier sync
+    # Save final checkpoint (each host independently)
     if cfg.enable_checkpointing:
-        if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-            barrier("final_checkpoint", timeout=300)
-        else:
-            sync_hosts("final_checkpoint")
-        
         final_checkpoint = {
             'topology': cfg.topology,
+            'host_id': host_info['host_id'],
             'last_processed_sample_idx': len(sequences) - 1,
             'total_samples_processed': len(sequences),
             'total_shards': storage.shard_count,
@@ -798,7 +791,19 @@ def main():
             'model_path': cfg.model_path,
             'status': 'completed'
         }
-        save_checkpoint_multihost(cfg.checkpoint_dir, cfg.topology, final_checkpoint)
+        checkpoint_path = os.path.join(
+            cfg.checkpoint_dir,
+            f"checkpoint_{cfg.topology}_host_{host_info['host_id']:02d}.json"
+        )
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        with open(checkpoint_path, 'w') as f:
+            json.dump(final_checkpoint, f, indent=2)
+
+        # Sync after all hosts save their checkpoints
+        if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+            barrier("final_checkpoint", timeout=300)
+        else:
+            sync_hosts("final_checkpoint")
     
     # Final sync using barrier
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
@@ -814,10 +819,11 @@ def main():
         print(f"  Topology: {cfg.topology}")
         print(f"  Hosts: {host_info['num_hosts']}")
         print(f"  Total samples processed: {len(sequences)}")
-        print(f"  Total shards created: {storage.shard_count}")
+        print(f"  Shards per host: {storage.shard_count}")
+        print(f"  Total shards (all hosts): ~{storage.shard_count * host_info['num_hosts']}")
         print(f"  Activations saved to: {cfg.output_dir}")
         if cfg.upload_to_gcs:
-            print(f"  GCS path: gs://{cfg.gcs_bucket}/{gcs_prefix}/")
+            print(f"  GCS path: gs://{cfg.gcs_bucket}/{gcs_prefix}/host_*/")
         print("=" * 70)
 
 

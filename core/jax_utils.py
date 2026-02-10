@@ -82,7 +82,7 @@ def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
         JAX Mesh object
     """
     devices = jax.devices()
-    num_local_devices = len(devices)
+    num_local_devices = jax.local_device_count()  # Per-host devices (e.g., 4 on v5litepod-64)
     num_hosts = jax.process_count()
     total_devices = jax.device_count()
     

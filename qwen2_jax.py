@@ -461,13 +461,21 @@ class QwenModel(nn.Module):
 
 
 def convert_hf_to_jax_weights(hf_model, config):
-    """Convert HuggingFace weights to JAX format."""
+    """Convert HuggingFace weights to JAX format.
+    
+    Raises:
+        ValueError: If any expected weight is missing from the HF model state dict.
+    """
     jax_params = {}
     state_dict = hf_model.state_dict()
     
     # Convert embeddings
-    if 'model.embed_tokens.weight' in state_dict:
-        jax_params['embed_tokens'] = {'embedding': state_dict['model.embed_tokens.weight'].numpy()}
+    if 'model.embed_tokens.weight' not in state_dict:
+        raise ValueError(
+            "Missing required weight: 'model.embed_tokens.weight'. "
+            "The HuggingFace model state dict may be corrupted or incompatible."
+        )
+    jax_params['embed_tokens'] = {'embedding': state_dict['model.embed_tokens.weight'].numpy()}
     
     # Convert each layer
     for layer_idx in range(config.num_hidden_layers):
@@ -475,52 +483,89 @@ def convert_hf_to_jax_weights(hf_model, config):
         hf_prefix = f'model.layers.{layer_idx}'
         jax_prefix = f'layers_{layer_idx}'
         
-        # Attention weights
-        if f'{hf_prefix}.self_attn.q_proj.weight' in state_dict:
-            layer_params['self_attn'] = {
-                'q_proj': {
-                    'kernel': state_dict[f'{hf_prefix}.self_attn.q_proj.weight'].T.numpy(),
-                    'bias': state_dict[f'{hf_prefix}.self_attn.q_proj.bias'].numpy()
-                },
-                'k_proj': {
-                    'kernel': state_dict[f'{hf_prefix}.self_attn.k_proj.weight'].T.numpy(),
-                    'bias': state_dict[f'{hf_prefix}.self_attn.k_proj.bias'].numpy()
-                },
-                'v_proj': {
-                    'kernel': state_dict[f'{hf_prefix}.self_attn.v_proj.weight'].T.numpy(),
-                    'bias': state_dict[f'{hf_prefix}.self_attn.v_proj.bias'].numpy()
-                },
-                'o_proj': {
-                    'kernel': state_dict[f'{hf_prefix}.self_attn.o_proj.weight'].T.numpy()
-                }
-            }
+        # Attention weights — required for every layer
+        attn_keys = [
+            f'{hf_prefix}.self_attn.q_proj.weight',
+            f'{hf_prefix}.self_attn.q_proj.bias',
+            f'{hf_prefix}.self_attn.k_proj.weight',
+            f'{hf_prefix}.self_attn.k_proj.bias',
+            f'{hf_prefix}.self_attn.v_proj.weight',
+            f'{hf_prefix}.self_attn.v_proj.bias',
+            f'{hf_prefix}.self_attn.o_proj.weight',
+        ]
+        missing_attn = [k for k in attn_keys if k not in state_dict]
+        if missing_attn:
+            raise ValueError(
+                f"Missing attention weights in layer {layer_idx}: {missing_attn}. "
+                f"The model checkpoint may be corrupted or a different architecture."
+            )
         
-        # MLP weights
-        if f'{hf_prefix}.mlp.gate_proj.weight' in state_dict:
-            layer_params['mlp'] = {
-                'gate_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.gate_proj.weight'].T.numpy()},
-                'up_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.up_proj.weight'].T.numpy()},
-                'down_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.down_proj.weight'].T.numpy()}
+        layer_params['self_attn'] = {
+            'q_proj': {
+                'kernel': state_dict[f'{hf_prefix}.self_attn.q_proj.weight'].T.numpy(),
+                'bias': state_dict[f'{hf_prefix}.self_attn.q_proj.bias'].numpy()
+            },
+            'k_proj': {
+                'kernel': state_dict[f'{hf_prefix}.self_attn.k_proj.weight'].T.numpy(),
+                'bias': state_dict[f'{hf_prefix}.self_attn.k_proj.bias'].numpy()
+            },
+            'v_proj': {
+                'kernel': state_dict[f'{hf_prefix}.self_attn.v_proj.weight'].T.numpy(),
+                'bias': state_dict[f'{hf_prefix}.self_attn.v_proj.bias'].numpy()
+            },
+            'o_proj': {
+                'kernel': state_dict[f'{hf_prefix}.self_attn.o_proj.weight'].T.numpy()
             }
+        }
         
-        # LayerNorm weights
-        if f'{hf_prefix}.input_layernorm.weight' in state_dict:
-            layer_params['input_layernorm'] = {
-                'weight': state_dict[f'{hf_prefix}.input_layernorm.weight'].numpy()
-            }
-        if f'{hf_prefix}.post_attention_layernorm.weight' in state_dict:
-            layer_params['post_attention_layernorm'] = {
-                'weight': state_dict[f'{hf_prefix}.post_attention_layernorm.weight'].numpy()
+        # MLP weights — required for every layer
+        mlp_keys = [
+            f'{hf_prefix}.mlp.gate_proj.weight',
+            f'{hf_prefix}.mlp.up_proj.weight',
+            f'{hf_prefix}.mlp.down_proj.weight',
+        ]
+        missing_mlp = [k for k in mlp_keys if k not in state_dict]
+        if missing_mlp:
+            raise ValueError(
+                f"Missing MLP weights in layer {layer_idx}: {missing_mlp}. "
+                f"The model checkpoint may be corrupted or a different architecture."
+            )
+        
+        layer_params['mlp'] = {
+            'gate_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.gate_proj.weight'].T.numpy()},
+            'up_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.up_proj.weight'].T.numpy()},
+            'down_proj': {'kernel': state_dict[f'{hf_prefix}.mlp.down_proj.weight'].T.numpy()}
+        }
+        
+        # LayerNorm weights — required for every layer
+        for norm_name in ['input_layernorm', 'post_attention_layernorm']:
+            norm_key = f'{hf_prefix}.{norm_name}.weight'
+            if norm_key not in state_dict:
+                raise ValueError(
+                    f"Missing LayerNorm weight in layer {layer_idx}: '{norm_key}'. "
+                    f"The model checkpoint may be corrupted or a different architecture."
+                )
+            layer_params[norm_name] = {
+                'weight': state_dict[norm_key].numpy()
             }
         
         jax_params[jax_prefix] = layer_params
     
-    # Final norm
-    if 'model.norm.weight' in state_dict:
-        jax_params['norm'] = {'weight': state_dict['model.norm.weight'].numpy()}
+    # Final norm — required
+    if 'model.norm.weight' not in state_dict:
+        raise ValueError(
+            "Missing required weight: 'model.norm.weight'. "
+            "The HuggingFace model state dict may be corrupted or incompatible."
+        )
+    jax_params['norm'] = {'weight': state_dict['model.norm.weight'].numpy()}
     
     # LM head (if not tied)
-    if 'lm_head.weight' in state_dict and not config.tie_word_embeddings:
+    if not config.tie_word_embeddings:
+        if 'lm_head.weight' not in state_dict:
+            raise ValueError(
+                "Missing required weight: 'lm_head.weight'. "
+                "tie_word_embeddings is False but no separate lm_head found."
+            )
         jax_params['lm_head'] = {'kernel': state_dict['lm_head.weight'].T.numpy()}
     
     return jax_params

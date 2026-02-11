@@ -49,7 +49,8 @@ class ActivationStorage:
 
         self.metadata = []
         self.shard_count = 0
-        self.total_samples = 0
+        self.total_activations = 0  # Total activation tensors stored (layers × samples)
+        self.seen_sample_indices = set()  # Track unique sample indices
         self.verbose = verbose
 
         # GCS settings
@@ -97,7 +98,8 @@ class ActivationStorage:
         }
 
         self.buffer[layer_idx].append(activation_data)
-        self.total_samples += 1
+        self.total_activations += 1
+        self.seen_sample_indices.add(sample_idx)
 
         # Estimate size (activation array + metadata overhead)
         activation_size = activation.nbytes
@@ -201,7 +203,8 @@ class ActivationStorage:
         with open(metadata_file, 'w') as f:
             json.dump({
                 'total_shards': self.shard_count,
-                'total_samples': self.total_samples,
+                'total_activations': self.total_activations,
+                'total_unique_samples': len(self.seen_sample_indices),
                 'shard_size_gb': self.shard_size_bytes / (1024 * 1024 * 1024),
                 'upload_to_gcs': self.upload_to_gcs,
                 'gcs_bucket': self.gcs_bucket,
@@ -214,7 +217,8 @@ class ActivationStorage:
             print(f"STORAGE SUMMARY")
             print(f"{'='*70}")
             print(f"  Total shards: {self.shard_count}")
-            print(f"  Total samples: {self.total_samples}")
+            print(f"  Total samples: {len(self.seen_sample_indices)}")
+            print(f"  Total activations: {self.total_activations}")
             print(f"  Metadata: {metadata_file}")
             if self.upload_to_gcs:
                 print(f"  GCS bucket: gs://{self.gcs_bucket}/{self.gcs_prefix}/")

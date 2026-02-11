@@ -73,6 +73,42 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
+def compute_rope_embeddings(head_dim, max_position_embeddings, rope_theta):
+    """Compute RoPE cos/sin tables once, to be shared across all layers.
+
+    Args:
+        head_dim: Dimension of each attention head
+        max_position_embeddings: Maximum sequence length
+        rope_theta: Base frequency for rotary embeddings
+
+    Returns:
+        (rope_cos, rope_sin): Each shaped (max_position_embeddings, head_dim)
+    """
+    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, head_dim, 2).astype(jnp.float32) / head_dim))
+    t = jnp.arange(max_position_embeddings).astype(jnp.float32)
+    freqs = jnp.outer(t, inv_freq)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)
+    return jnp.cos(emb), jnp.sin(emb)
+
+
+def _expand_kv_heads(x, num_groups):
+    """Expand KV heads for GQA using zero-copy broadcast.
+
+    Args:
+        x: (batch, num_kv_heads, seq_len, head_dim)
+        num_groups: Number of query groups per KV head
+
+    Returns:
+        (batch, num_kv_heads * num_groups, seq_len, head_dim)
+    """
+    batch, num_kv_heads, seq_len, head_dim = x.shape
+    x = jnp.broadcast_to(
+        x[:, :, jnp.newaxis, :, :],
+        (batch, num_kv_heads, num_groups, seq_len, head_dim)
+    )
+    return x.reshape(batch, num_kv_heads * num_groups, seq_len, head_dim)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm implementation."""
     dim: int
@@ -131,19 +167,16 @@ class QwenAttention(nn.Module):
         self.max_position_embeddings = self.config.max_position_embeddings
         self.rope_theta = self.config.rope_theta
 
-        # Pre-compute and cache RoPE embeddings
-        dim = self.head_dim
-        max_seq_len = self.max_position_embeddings
-        inv_freq = 1.0 / (self.rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
-        t = jnp.arange(max_seq_len).astype(jnp.float32)
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.rope_cos = jnp.cos(emb)
-        self.rope_sin = jnp.sin(emb)
-
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None, kv_cache=None, position_offset=0):
+    def __call__(self, hidden_states, attention_mask=None, kv_cache=None,
+                 position_offset=0, rope_cos=None, rope_sin=None):
         batch_size, seq_len, _ = hidden_states.shape
+
+        # Compute RoPE locally if not passed in (backward compatibility)
+        if rope_cos is None or rope_sin is None:
+            rope_cos, rope_sin = compute_rope_embeddings(
+                self.head_dim, self.max_position_embeddings, self.rope_theta
+            )
 
         q_proj = nn.Dense(
             self.num_heads * self.head_dim,
@@ -169,12 +202,10 @@ class QwenAttention(nn.Module):
         k = k_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v_proj.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # Apply rotary embeddings (use cached values)
-        # Use dynamic_slice instead of arange to avoid tracer issues
-        # Create position_ids by slicing the pre-computed position array
+        # Apply rotary embeddings using shared RoPE tables
         all_positions = jnp.arange(self.max_position_embeddings)
         position_ids = lax.dynamic_slice(all_positions, (position_offset,), (seq_len,))
-        q, k = apply_rotary_pos_emb(q, k, self.rope_cos, self.rope_sin, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin, position_ids)
 
         # Handle KV cache
         if kv_cache is not None:
@@ -184,10 +215,10 @@ class QwenAttention(nn.Module):
 
         new_kv_cache = (k, v)
 
-        # Repeat k/v heads if using GQA
+        # Expand k/v heads for GQA using zero-copy broadcast
         if self.num_key_value_groups > 1:
-            k = jnp.repeat(k, self.num_key_value_groups, axis=1)
-            v = jnp.repeat(v, self.num_key_value_groups, axis=1)
+            k = _expand_kv_heads(k, self.num_key_value_groups)
+            v = _expand_kv_heads(v, self.num_key_value_groups)
 
         # Compute attention scores
         attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
@@ -231,19 +262,9 @@ class QwenAttentionFixed(nn.Module):
         self.max_position_embeddings = self.config.max_position_embeddings
         self.rope_theta = self.config.rope_theta
 
-        # Pre-compute and cache RoPE embeddings
-        dim = self.head_dim
-        max_seq_len = self.max_position_embeddings
-        inv_freq = 1.0 / (self.rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
-        t = jnp.arange(max_seq_len).astype(jnp.float32)
-        freqs = jnp.outer(t, inv_freq)
-        emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.rope_cos = jnp.cos(emb)
-        self.rope_sin = jnp.sin(emb)
-
     @nn.compact
     def __call__(self, hidden_states, attention_mask=None, cache_dict=None, layer_idx=0,
-                 position_offset=0, is_prefill=False):
+                 position_offset=0, is_prefill=False, rope_cos=None, rope_sin=None):
         """
         Forward pass with fixed-size KV cache
 
@@ -254,12 +275,20 @@ class QwenAttentionFixed(nn.Module):
             layer_idx: Which layer this is (for indexing into cache)
             position_offset: Position offset for RoPE
             is_prefill: Whether this is prefill phase
+            rope_cos: Pre-computed RoPE cosine table (shared across layers)
+            rope_sin: Pre-computed RoPE sine table (shared across layers)
 
         Returns:
             attn_output: [batch, seq_len, hidden_dim]
             cache_dict: Updated cache dictionary
         """
         batch_size, seq_len, _ = hidden_states.shape
+
+        # Compute RoPE locally if not passed in (backward compatibility)
+        if rope_cos is None or rope_sin is None:
+            rope_cos, rope_sin = compute_rope_embeddings(
+                self.head_dim, self.max_position_embeddings, self.rope_theta
+            )
 
         # Project Q, K, V
         q_proj = nn.Dense(
@@ -291,10 +320,10 @@ class QwenAttentionFixed(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Apply RoPE
+        # Apply RoPE using shared tables
         all_positions = jnp.arange(self.max_position_embeddings)
         position_ids = lax.dynamic_slice(all_positions, (position_offset,), (seq_len,))
-        q, k = apply_rotary_pos_emb(q, k, self.rope_cos, self.rope_sin, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin, position_ids)
 
         # Handle cache
         if cache_dict is not None:
@@ -346,10 +375,10 @@ class QwenAttentionFixed(nn.Module):
             k_full = k
             v_full = v
 
-        # Repeat k/v heads if using GQA
+        # Expand k/v heads for GQA using zero-copy broadcast
         if self.num_key_value_groups > 1:
-            k_full = jnp.repeat(k_full, self.num_key_value_groups, axis=1)
-            v_full = jnp.repeat(v_full, self.num_key_value_groups, axis=1)
+            k_full = _expand_kv_heads(k_full, self.num_key_value_groups)
+            v_full = _expand_kv_heads(v_full, self.num_key_value_groups)
 
         # Compute attention
         attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
@@ -379,13 +408,15 @@ class QwenDecoderLayer(nn.Module):
     config: QwenConfig
 
     @nn.compact
-    def __call__(self, hidden_states, attention_mask=None, kv_cache=None, position_offset=0):
+    def __call__(self, hidden_states, attention_mask=None, kv_cache=None,
+                 position_offset=0, rope_cos=None, rope_sin=None):
         residual = hidden_states
 
         # Self Attention
         hidden_states = RMSNorm(self.config.hidden_size, self.config.rms_norm_eps, self.config.dtype, name='input_layernorm')(hidden_states)
         hidden_states, new_kv_cache = QwenAttention(self.config, name='self_attn')(
-            hidden_states, attention_mask, kv_cache, position_offset
+            hidden_states, attention_mask, kv_cache, position_offset,
+            rope_cos=rope_cos, rope_sin=rope_sin
         )
         hidden_states = residual + hidden_states
 
@@ -428,12 +459,19 @@ class QwenModel(nn.Module):
                 attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
                 attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
 
+        # Compute RoPE embeddings once, shared across all layers
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        rope_cos, rope_sin = compute_rope_embeddings(
+            head_dim, self.config.max_position_embeddings, self.config.rope_theta
+        )
+
         # Apply decoder layers
         new_kv_caches = []
         for i in range(self.config.num_hidden_layers):
             layer_kv_cache = kv_caches[i] if kv_caches is not None else None
             hidden_states, new_kv_cache = QwenDecoderLayer(self.config, name=f'layers_{i}')(
-                hidden_states, attention_mask, layer_kv_cache, position_offset
+                hidden_states, attention_mask, layer_kv_cache, position_offset,
+                rope_cos=rope_cos, rope_sin=rope_sin
             )
             new_kv_caches.append(new_kv_cache)
 

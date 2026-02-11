@@ -20,7 +20,8 @@ import time
 
 from qwen2_jax import (
     QwenConfig, RMSNorm, QwenMLP, QwenAttention,
-    rotate_half, apply_rotary_pos_emb, convert_hf_to_jax_weights
+    rotate_half, apply_rotary_pos_emb, convert_hf_to_jax_weights,
+    compute_rope_embeddings
 )
 
 
@@ -30,7 +31,8 @@ class QwenDecoderLayerWithHooks(nn.Module):
 
     @nn.compact
     def __call__(self, hidden_states, attention_mask=None, kv_cache=None,
-                 position_offset=0, return_activations=False):
+                 position_offset=0, return_activations=False,
+                 rope_cos=None, rope_sin=None):
         residual = hidden_states
 
         # Self Attention with pre-attention norm
@@ -44,7 +46,8 @@ class QwenDecoderLayerWithHooks(nn.Module):
         hidden_states_attn, new_kv_cache = QwenAttention(
             self.config,
             name='self_attn'
-        )(hidden_states_norm, attention_mask, kv_cache, position_offset)
+        )(hidden_states_norm, attention_mask, kv_cache, position_offset,
+          rope_cos=rope_cos, rope_sin=rope_sin)
 
         # Store attention output BEFORE residual if requested
         attn_activation = hidden_states_attn if return_activations else None
@@ -139,6 +142,12 @@ class QwenModelWithActivations(nn.Module):
         new_kv_caches = []
         activations = {} if return_activations else None
 
+        # Compute RoPE embeddings once, shared across all layers
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        rope_cos, rope_sin = compute_rope_embeddings(
+            head_dim, self.config.max_position_embeddings, self.config.rope_theta
+        )
+
         for i in range(self.config.num_hidden_layers):
             layer_kv_cache = kv_caches[i] if kv_caches is not None else None
 
@@ -150,7 +159,8 @@ class QwenModelWithActivations(nn.Module):
             hidden_states, new_kv_cache, layer_activations = QwenDecoderLayerWithHooks(
                 self.config,
                 name=f'layers_{i}'
-            )(hidden_states, attention_mask, layer_kv_cache, position_offset, extract_this_layer)
+            )(hidden_states, attention_mask, layer_kv_cache, position_offset,
+              extract_this_layer, rope_cos=rope_cos, rope_sin=rope_sin)
 
             new_kv_caches.append(new_kv_cache)
 

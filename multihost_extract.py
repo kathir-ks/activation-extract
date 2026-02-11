@@ -247,6 +247,12 @@ def process_batch_multihost(
     # JAX SPMD already synchronizes workers - no explicit barrier needed
     activations = extract_activations_sharded(model, params, input_ids)
 
+    # Synchronize all hosts before gathering activations.
+    # Without this, a fast host could start the next batch's device_put
+    # while a slow host is still reading shards — causing a collective desync.
+    from core.barrier_sync import barrier
+    barrier("pre_gather")
+
     # ── FSDP path: each host extracts its own addressable shard ──────
     if mesh is not None and sharding_specs is not None:
         # Transfer this host's addressable shards to numpy
@@ -254,7 +260,11 @@ def process_batch_multihost(
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
             if layer_key in activations:
-                local_shards = activations[layer_key].addressable_shards
+                # Sort shards by index to guarantee batch-dimension ordering
+                local_shards = sorted(
+                    activations[layer_key].addressable_shards,
+                    key=lambda s: s.index,
+                )
                 local_data = np.concatenate(
                     [np.array(s.data) for s in local_shards], axis=0
                 )

@@ -66,7 +66,11 @@ if [ "$TEST_ONLY" = false ]; then
             fi
             cd ~/$WORK_DIR
 
-            # Install deps
+            # Install JAX with TPU support first
+            echo 'Installing JAX TPU...'
+            pip3 install --upgrade 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html --quiet 2>&1 | tail -2
+
+            # Install remaining deps
             echo 'Installing dependencies...'
             pip3 install --upgrade -r requirements.txt --quiet 2>&1 | tail -2
 

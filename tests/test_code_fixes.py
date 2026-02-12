@@ -138,7 +138,7 @@ def test_storage_counter():
                     layer_idx=layer_idx,
                     sample_idx=sample_idx,
                     activation=np.random.randn(10, 64).astype(np.float32),
-                    token_ids=[1, 2, 3]
+                    text_preview="test sample"
                 )
         assert storage.total_activations == 6, \
             f"Expected 6 activations, got {storage.total_activations}"

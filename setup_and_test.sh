@@ -46,6 +46,16 @@ echo ""
 # ============================================
 if [ "$TEST_ONLY" = false ]; then
     echo "Step 1: Setting up all workers..."
+    echo ""
+
+    # Kill stale Python processes that may be locking the TPU
+    echo "  Killing stale processes on all workers..."
+    gcloud compute tpus tpu-vm ssh $TPU_NAME \
+        --zone=$ZONE \
+        --worker=all \
+        --command="pkill -f 'python3.*test_code_fixes' 2>/dev/null; pkill -f 'python3.*multihost_extract' 2>/dev/null; true" 2>/dev/null || true
+    sleep 3
+
     echo "  Cloning repo + installing deps on all workers..."
     echo ""
 
@@ -74,10 +84,10 @@ if [ "$TEST_ONLY" = false ]; then
             echo 'Installing dependencies...'
             pip3 install --upgrade -r requirements.txt --quiet 2>&1 | tail -2
 
-            # Verify JAX
-            python3 -c \"
+            # Verify JAX (use CPU to avoid TPU lock issues during setup)
+            JAX_PLATFORMS=cpu python3 -c \"
 import jax
-print(f'  JAX {jax.__version__} | Devices: {len(jax.devices())} | Backend: {jax.default_backend()}')
+print(f'  JAX {jax.__version__} | Backend: {jax.default_backend()} (cpu mode for verification)')
 \"
             echo '✅ Worker \$(hostname) ready'
         "
@@ -86,7 +96,15 @@ print(f'  JAX {jax.__version__} | Devices: {len(jax.devices())} | Backend: {jax.
     echo "✅ All workers set up"
     echo ""
 else
-    echo "Step 1: Skipped (--test-only)"
+    echo "Step 1: Skipped (--test-only), pulling latest code..."
+    echo ""
+
+    # Kill stale processes + pull latest code
+    gcloud compute tpus tpu-vm ssh $TPU_NAME \
+        --zone=$ZONE \
+        --worker=all \
+        --command="pkill -f 'python3.*test_code_fixes' 2>/dev/null; pkill -f 'python3.*multihost_extract' 2>/dev/null; cd ~/$WORK_DIR && git fetch --all -q && git reset --hard origin/main -q; echo 'Updated \$(hostname)'" 2>/dev/null || true
+    sleep 2
     echo ""
 fi
 

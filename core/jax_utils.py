@@ -65,7 +65,7 @@ def initialize_multihost(
     return jax.device_count()
 
 
-def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
+def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False, fsdp_size: Optional[int] = None) -> Mesh:
     """
     Create device mesh for sharded computation
     
@@ -77,7 +77,10 @@ def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
         mesh_type: 'auto', '1d', '2d', or '3d'
                    'auto' selects 1D for single-host, 3D for multi-host
         verbose: Print mesh info
-    
+        fsdp_size: Number of devices for FSDP axis in 3D mesh. If None,
+                   defaults to min(2, num_local_devices). Must divide
+                   num_local_devices evenly.
+
     Returns:
         JAX Mesh object
     """
@@ -117,16 +120,21 @@ def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
         # 3D mesh: (data, fsdp, model) for FSDP
         if num_hosts > 1:
             # Multi-host FSDP:
-            # data = num_hosts (batch parallelism across hosts)  
+            # data = num_hosts (batch parallelism across hosts)
             # fsdp = devices per host (parameter sharding within host)
             # For v5e pods, the physical torus is [8,8,1]
             # We use allow_split_physical_axes to map arbitrary logical shapes
-            fsdp_size = min(2, num_local_devices)
-            model_size = num_local_devices // fsdp_size
+            _fsdp = fsdp_size if fsdp_size is not None else min(2, num_local_devices)
+            if num_local_devices % _fsdp != 0:
+                raise ValueError(
+                    f"fsdp_size={_fsdp} does not evenly divide "
+                    f"num_local_devices={num_local_devices}"
+                )
+            model_size = num_local_devices // _fsdp
             
             try:
                 device_array = mesh_utils.create_device_mesh(
-                    (num_hosts, fsdp_size, model_size),
+                    (num_hosts, _fsdp, model_size),
                     devices=None,
                     allow_split_physical_axes=True
                 )
@@ -142,9 +150,9 @@ def create_device_mesh(mesh_type: str = 'auto', verbose: bool = False) -> Mesh:
                 mesh = Mesh(device_array, axis_names=('data', 'fsdp'))
         else:
             # Single-host: fsdp and model only
-            fsdp_size = min(2, num_local_devices)
-            model_size = num_local_devices // fsdp_size
-            device_array = mesh_utils.create_device_mesh((fsdp_size, model_size), devices)
+            _fsdp_sh = fsdp_size if fsdp_size is not None else min(2, num_local_devices)
+            model_size = num_local_devices // _fsdp_sh
+            device_array = mesh_utils.create_device_mesh((_fsdp_sh, model_size), devices)
             mesh = Mesh(device_array, axis_names=('fsdp', 'model'))
     else:
         raise ValueError(f"Unknown mesh_type: {mesh_type}")

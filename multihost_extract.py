@@ -122,6 +122,7 @@ class MultihostExtractionConfig:
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 32  # Global batch size across all hosts
     max_seq_length: int = 2048
+    fsdp_size: Optional[int] = None  # FSDP axis size (default: min(2, local_devices))
     
     # Output config
     output_dir: str = './activations'
@@ -353,7 +354,9 @@ def main():
     parser.add_argument('--activation_type', type=str, default='residual',
                         choices=['residual', 'mlp', 'attn'])
     parser.add_argument('--max_seq_length', type=int, default=2048)
-    
+    parser.add_argument('--fsdp_size', type=int, default=None,
+                        help="FSDP axis size for 3D mesh (default: min(2, local_devices))")
+
     # Output args
     parser.add_argument('--output_dir', type=str, default='./activations')
     
@@ -511,7 +514,7 @@ def main():
     # =========================================================================
     
     # Use auto-detected mesh (1D for single-host, 3D for multi-host)
-    mesh = create_device_mesh('auto', verbose=host_info['is_primary'] and cfg.verbose)
+    mesh = create_device_mesh('auto', verbose=host_info['is_primary'] and cfg.verbose, fsdp_size=cfg.fsdp_size)
     sharding_specs = create_sharding_strategy(mesh)
     
     # =========================================================================

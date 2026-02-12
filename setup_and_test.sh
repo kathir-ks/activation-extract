@@ -91,23 +91,24 @@ else
 fi
 
 # ============================================
-# Step 2: Run unit tests on worker 0
+# Step 2: Run unit tests on all workers (CPU backend)
 # ============================================
-echo "Step 2: Running unit tests on worker 0..."
+echo "Step 2: Running unit tests on all workers (CPU backend)..."
+echo "  (Using CPU backend because TPU init requires all hosts in sync)"
 echo ""
 
 gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \
-    --worker=0 \
+    --worker=all \
     --command="
-        cd ~/$WORK_DIR && python3 tests/test_code_fixes.py
+        cd ~/$WORK_DIR && JAX_PLATFORMS=cpu python3 tests/test_code_fixes.py
     "
 
 UNIT_EXIT=$?
 echo ""
 
 if [ $UNIT_EXIT -eq 0 ]; then
-    echo "✅ Unit tests passed"
+    echo "✅ Unit tests passed on all workers"
 else
     echo "❌ Unit tests failed (exit code: $UNIT_EXIT)"
     exit $UNIT_EXIT

@@ -138,6 +138,8 @@ class MultihostExtractionConfig:
     # Checkpointing
     enable_checkpointing: bool = True
     checkpoint_dir: str = './checkpoints'
+    checkpoint_gcs_bucket: Optional[str] = None   # GCS bucket for durable checkpoints
+    checkpoint_gcs_prefix: str = 'checkpoints'    # GCS prefix for checkpoint files
     
     # Barrier synchronization for multihost coordination
     enable_barrier_sync: bool = True  # Enable socket-based barrier sync
@@ -149,12 +151,21 @@ class MultihostExtractionConfig:
     random_seed: Optional[int] = 42
     verbose: bool = True
     
+    # Stream mode (process multiple streams sequentially)
+    stream_mode: bool = False
+    stream_manifest: Optional[str] = None      # GCS/local path to manifest
+    stream_range_start: Optional[int] = None   # First stream ID for this pod
+    stream_range_end: Optional[int] = None     # Last stream ID for this pod
+    pod_id: Optional[str] = None               # Pod identifier for manifest
+    
     def __post_init__(self):
         # Validate
         if self.upload_to_gcs and not self.gcs_bucket:
             raise ValueError("--gcs_bucket required when --upload_to_gcs is set")
-        if not self.dataset_path:
-            raise ValueError("--dataset_path is required")
+        if not self.dataset_path and not self.stream_mode:
+            raise ValueError("--dataset_path is required (or use --stream_mode)")
+        if self.stream_mode and not self.stream_manifest:
+            raise ValueError("--stream_manifest required when --stream_mode is set")
 
 
 class MultihostActivationStorage(ActivationStorage):
@@ -197,19 +208,82 @@ class MultihostActivationStorage(ActivationStorage):
         sync_hosts("finalize_storage")
 
 
-def load_checkpoint_multihost(checkpoint_dir: str, topology: str, host_id: int) -> Dict:
-    """Load checkpoint file for this host if it exists"""
-    checkpoint_path = os.path.join(
-        checkpoint_dir,
-        f"checkpoint_{topology}_host_{host_id:02d}.json"
-    )
-    if os.path.exists(checkpoint_path):
+def _checkpoint_filename(topology: str, host_id: int) -> str:
+    """Consistent checkpoint filename across save/load."""
+    return f"checkpoint_{topology}_host_{host_id:02d}.json"
+
+
+def load_checkpoint_multihost(
+    checkpoint_dir: str,
+    topology: str,
+    host_id: int,
+    gcs_bucket: Optional[str] = None,
+    gcs_prefix: str = 'checkpoints',
+) -> Dict:
+    """Load checkpoint file for this host, with GCS fallback.
+
+    Tries local first, then GCS. This ensures recovery after preemption
+    (which destroys local disk) as long as checkpoints were persisted to GCS.
+    """
+    filename = _checkpoint_filename(topology, host_id)
+
+    # Try local first
+    local_path = os.path.join(checkpoint_dir, filename)
+    if os.path.exists(local_path):
         try:
-            with open(checkpoint_path, 'r') as f:
-                return json.load(f)
+            with open(local_path, 'r') as f:
+                data = json.load(f)
+                data['_source'] = 'local'
+                return data
         except Exception as e:
-            print(f"Warning: Failed to load checkpoint: {e}")
+            print(f"Warning: Failed to load local checkpoint: {e}")
+
+    # Fall back to GCS
+    if gcs_bucket:
+        gcs_path = f"gs://{gcs_bucket}/{gcs_prefix}/{filename}"
+        try:
+            import fsspec
+            fs = fsspec.filesystem('gs')
+            if fs.exists(gcs_path):
+                with fs.open(gcs_path, 'r') as f:
+                    data = json.load(f)
+                    data['_source'] = 'gcs'
+                    print(f"  📥 Loaded checkpoint from GCS: {gcs_path}")
+                    return data
+        except Exception as e:
+            print(f"Warning: Failed to load GCS checkpoint: {e}")
+
     return {}
+
+
+def save_checkpoint_multihost(
+    checkpoint_data: Dict,
+    checkpoint_dir: str,
+    topology: str,
+    host_id: int,
+    gcs_bucket: Optional[str] = None,
+    gcs_prefix: str = 'checkpoints',
+):
+    """Save checkpoint locally AND to GCS for preemption safety."""
+    filename = _checkpoint_filename(topology, host_id)
+
+    # Save locally
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    local_path = os.path.join(checkpoint_dir, filename)
+    with open(local_path, 'w') as f:
+        json.dump(checkpoint_data, f, indent=2)
+
+    # Save to GCS
+    if gcs_bucket:
+        gcs_path = f"gs://{gcs_bucket}/{gcs_prefix}/{filename}"
+        try:
+            import fsspec
+            fs = fsspec.filesystem('gs')
+            with fs.open(gcs_path, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to save checkpoint to GCS: {e}")
+
 
 
 def process_batch_multihost(
@@ -372,6 +446,10 @@ def main():
     parser.add_argument('--enable_checkpointing', action='store_true', default=True)
     parser.add_argument('--no_checkpointing', action='store_false', dest='enable_checkpointing')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+    parser.add_argument('--checkpoint_gcs_bucket', type=str, default=None,
+                        help="GCS bucket for durable checkpoints (survives preemption)")
+    parser.add_argument('--checkpoint_gcs_prefix', type=str, default='checkpoints',
+                        help="GCS prefix for checkpoint files")
     
     # Barrier sync args
     parser.add_argument('--enable_barrier_sync', action='store_true', default=True,
@@ -389,14 +467,79 @@ def main():
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--verbose', action='store_true', default=True)
     
+    # Stream mode args
+    parser.add_argument('--stream_mode', action='store_true', default=False,
+                        help="Process multiple streams sequentially from manifest")
+    parser.add_argument('--stream_manifest', type=str, default=None,
+                        help="GCS/local path to stream manifest JSON")
+    parser.add_argument('--stream_range_start', type=int, default=None,
+                        help="First stream ID assigned to this pod")
+    parser.add_argument('--stream_range_end', type=int, default=None,
+                        help="Last stream ID assigned to this pod")
+    parser.add_argument('--pod_id', type=str, default=None,
+                        help="Pod identifier for manifest tracking")
+    
     args = parser.parse_args()
     
     # Build config
     config_dict = {k: v for k, v in vars(args).items() if v is not None}
+    # Allow empty dataset_path in stream_mode
+    if args.stream_mode and not args.dataset_path:
+        config_dict.setdefault('dataset_path', '')
     cfg = MultihostExtractionConfig(**config_dict)
     
-    # Validate batch size is divisible by number of hosts (required for FSDP)
-    # Note: num_hosts may not be known yet, validation will happen after initialization
+    # =========================================================================
+    # Stream mode: process multiple streams sequentially
+    # =========================================================================
+    if cfg.stream_mode:
+        from core.stream_manager import StreamManager
+        sm = StreamManager(cfg.stream_manifest, verbose=cfg.verbose)
+        
+        stream_range = None
+        if cfg.stream_range_start is not None and cfg.stream_range_end is not None:
+            stream_range = (cfg.stream_range_start, cfg.stream_range_end)
+        
+        pod_id = cfg.pod_id or cfg.topology
+        stream_count = 0
+        
+        while True:
+            stream = sm.claim_next_stream(pod_id, stream_range)
+            if stream is None:
+                break
+            
+            stream_count += 1
+            stream_id = stream['stream_id']
+            dataset_path = stream['dataset_path']
+            
+            print(f"\n{'='*70}")
+            print(f"STREAM MODE: Processing stream {stream_id} ({dataset_path})")
+            print(f"{'='*70}")
+            
+            # Override dataset_path for this stream
+            cfg.dataset_path = dataset_path
+            
+            try:
+                run_extraction(cfg)
+                sm.mark_stream_complete(stream_id)
+            except Exception as e:
+                print(f"\n❌ Stream {stream_id} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't mark complete — it stays in_progress for retry
+                break
+        
+        if stream_count > 0:
+            status = sm.get_status_summary()
+            print(f"\n✅ Stream mode complete. Processed {stream_count} streams.")
+            print(f"   Overall: {status['completed']}/{status['total']} completed ({status['pct_complete']}%)")
+        return
+    
+    # Single-stream mode (original behavior)
+    run_extraction(cfg)
+
+
+def run_extraction(cfg):
+    """Run extraction for a single dataset with the given config."""
     
     # =========================================================================
     # Step 0: Start barrier server BEFORE JAX init (if this is the server worker)
@@ -522,19 +665,36 @@ def main():
     # =========================================================================
     
     start_sample_idx = 0
+    resume_shard_count = 0
+    resume_activation_count = 0
     if cfg.enable_checkpointing:
+        # Use --gcs_bucket as fallback for checkpoint GCS bucket if not set explicitly
+        ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
         checkpoint = load_checkpoint_multihost(
-            cfg.checkpoint_dir, cfg.topology, host_info['host_id']
+            cfg.checkpoint_dir, cfg.topology, host_info['host_id'],
+            gcs_bucket=ckpt_gcs_bucket,
+            gcs_prefix=cfg.checkpoint_gcs_prefix,
         )
-        if checkpoint:
+        if checkpoint and checkpoint.get('status') != 'completed':
             start_sample_idx = checkpoint.get('last_processed_sample_idx', 0) + 1
+            resume_shard_count = checkpoint.get('total_shards', 0)
+            resume_activation_count = checkpoint.get('total_activations', 0)
             if host_info['is_primary']:
-                print(f"\n📌 RESUMING FROM CHECKPOINT (Host {host_info['host_id']})")
+                source = checkpoint.get('_source', 'unknown')
+                print(f"\n📌 RESUMING FROM CHECKPOINT (Host {host_info['host_id']}, source: {source})")
                 print(f"  Last processed sample: {checkpoint.get('last_processed_sample_idx', 0)}")
                 print(f"  Starting from sample: {start_sample_idx}")
+                print(f"  Resuming from shard: {resume_shard_count}")
+        elif checkpoint and checkpoint.get('status') == 'completed':
+            if host_info['is_primary']:
+                print(f"\n✅ Checkpoint shows extraction already completed. Skipping.")
+            return
 
-    # Sync after checkpoint loading
-    sync_hosts("checkpoint_loaded")
+    # Validate all hosts resume from the same point
+    if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
+        barrier(f"checkpoint_loaded_at_{start_sample_idx}", timeout=120)
+    else:
+        sync_hosts("checkpoint_loaded")
     
     # =========================================================================
     # Step 4: Load dataset (each host loads full dataset, then filters)
@@ -690,7 +850,9 @@ def main():
         shard_size_gb=cfg.shard_size_gb,
         compress_shards=cfg.compress_shards,
         delete_local_after_upload=cfg.delete_local_after_upload,
-        verbose=cfg.verbose
+        verbose=cfg.verbose,
+        resume_from_shard=resume_shard_count,
+        resume_from_activations=resume_activation_count,
     )
     
     # =========================================================================
@@ -763,23 +925,24 @@ def main():
             
             # Checkpoint after shard creation (each host saves independently)
             if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
-                checkpoint_data = {
-                    'topology': cfg.topology,
-                    'host_id': host_info['host_id'],
-                    'last_processed_sample_idx': global_end - 1,
-                    'total_samples_processed': global_end,
-                    'total_shards': storage.shard_count,
-                    'dataset_path': cfg.dataset_path,
-                    'model_path': cfg.model_path,
-                }
-                # Each host saves its own checkpoint
-                checkpoint_path = os.path.join(
-                    cfg.checkpoint_dir,
-                    f"checkpoint_{cfg.topology}_host_{host_info['host_id']:02d}.json"
+                ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
+                save_checkpoint_multihost(
+                    checkpoint_data={
+                        'topology': cfg.topology,
+                        'host_id': host_info['host_id'],
+                        'last_processed_sample_idx': global_end - 1,
+                        'total_samples_processed': global_end,
+                        'total_shards': storage.shard_count,
+                        'total_activations': storage.total_activations,
+                        'dataset_path': cfg.dataset_path,
+                        'model_path': cfg.model_path,
+                    },
+                    checkpoint_dir=cfg.checkpoint_dir,
+                    topology=cfg.topology,
+                    host_id=host_info['host_id'],
+                    gcs_bucket=ckpt_gcs_bucket,
+                    gcs_prefix=cfg.checkpoint_gcs_prefix,
                 )
-                os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-                with open(checkpoint_path, 'w') as f:
-                    json.dump(checkpoint_data, f, indent=2)
 
                 last_saved_shard_count = storage.shard_count
 
@@ -794,23 +957,25 @@ def main():
     
     # Save final checkpoint (each host independently)
     if cfg.enable_checkpointing:
-        final_checkpoint = {
-            'topology': cfg.topology,
-            'host_id': host_info['host_id'],
-            'last_processed_sample_idx': len(sequences) - 1,
-            'total_samples_processed': len(sequences),
-            'total_shards': storage.shard_count,
-            'dataset_path': cfg.dataset_path,
-            'model_path': cfg.model_path,
-            'status': 'completed'
-        }
-        checkpoint_path = os.path.join(
-            cfg.checkpoint_dir,
-            f"checkpoint_{cfg.topology}_host_{host_info['host_id']:02d}.json"
+        ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
+        save_checkpoint_multihost(
+            checkpoint_data={
+                'topology': cfg.topology,
+                'host_id': host_info['host_id'],
+                'last_processed_sample_idx': len(sequences) - 1,
+                'total_samples_processed': len(sequences),
+                'total_shards': storage.shard_count,
+                'total_activations': storage.total_activations,
+                'dataset_path': cfg.dataset_path,
+                'model_path': cfg.model_path,
+                'status': 'completed'
+            },
+            checkpoint_dir=cfg.checkpoint_dir,
+            topology=cfg.topology,
+            host_id=host_info['host_id'],
+            gcs_bucket=ckpt_gcs_bucket,
+            gcs_prefix=cfg.checkpoint_gcs_prefix,
         )
-        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-        with open(checkpoint_path, 'w') as f:
-            json.dump(final_checkpoint, f, indent=2)
 
         # Sync after all hosts save their checkpoints
         if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:

@@ -25,7 +25,10 @@ class ActivationStorage:
         shard_size_gb: float = 1.0,
         compress_shards: bool = True,
         delete_local_after_upload: bool = False,
-        verbose: bool = True
+        verbose: bool = True,
+        resume_from_shard: int = 0,
+        resume_from_activations: int = 0,
+        resume_from_samples: int = 0,
     ):
         """
         Initialize activation storage
@@ -39,6 +42,9 @@ class ActivationStorage:
             compress_shards: Whether to gzip compress shards
             delete_local_after_upload: Delete local files after GCS upload
             verbose: Print progress messages
+            resume_from_shard: Continue shard numbering from this value (0 = fresh start)
+            resume_from_activations: Restore total_activations counter on resume
+            resume_from_samples: Restore seen_sample count on resume
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -48,10 +54,14 @@ class ActivationStorage:
         self.shard_size_bytes = int(shard_size_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
 
         self.metadata = []
-        self.shard_count = 0
-        self.total_activations = 0  # Total activation tensors stored (layers × samples)
+        self.shard_count = resume_from_shard
+        self.total_activations = resume_from_activations
         self.seen_sample_indices = set()  # Track unique sample indices
         self.verbose = verbose
+
+        if resume_from_shard > 0 and verbose:
+            print(f"  📌 Resuming storage from shard {resume_from_shard} "
+                  f"(prev activations: {resume_from_activations})")
 
         # GCS settings
         self.upload_to_gcs = upload_to_gcs

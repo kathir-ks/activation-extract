@@ -558,7 +558,7 @@ def run_extraction(cfg):
     is_barrier_server = (worker_id == 0)
 
     # Allow explicit override via CLI flag (for manual setups)
-    if args.is_barrier_server:
+    if cfg.is_barrier_server:
         is_barrier_server = True
         worker_id = 0
 

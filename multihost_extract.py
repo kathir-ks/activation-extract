@@ -412,7 +412,7 @@ def main():
     parser.add_argument('--model_path', type=str, default="Qwen/Qwen2.5-0.5B")
     
     # Dataset args
-    parser.add_argument('--dataset_path', type=str, required=True,
+    parser.add_argument('--dataset_path', type=str, required=False, default="",
                         help="Path to JSONL dataset")
     parser.add_argument('--max_tasks', type=int, help="Maximum tasks to process")
     
@@ -558,7 +558,7 @@ def run_extraction(cfg):
     is_barrier_server = (worker_id == 0)
 
     # Allow explicit override via CLI flag (for manual setups)
-    if args.is_barrier_server:
+    if cfg.is_barrier_server:
         is_barrier_server = True
         worker_id = 0
 
@@ -690,9 +690,20 @@ def run_extraction(cfg):
                 print(f"\n✅ Checkpoint shows extraction already completed. Skipping.")
             return
 
-    # Validate all hosts resume from the same point
+    # Validate all hosts resume from the same point.
+    # The barrier name includes start_sample_idx so that if hosts loaded different
+    # checkpoints (e.g. one from GCS, another from stale local), the barrier name
+    # will differ and cause a timeout — surfacing the mismatch immediately.
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-        barrier(f"checkpoint_loaded_at_{start_sample_idx}", timeout=120)
+        barrier_name = f"checkpoint_loaded_at_{start_sample_idx}"
+        if not barrier(barrier_name, timeout=120):
+            raise RuntimeError(
+                f"Checkpoint mismatch detected! This host (host_id={host_info['host_id']}) "
+                f"wants to resume from sample {start_sample_idx}, but other hosts have a "
+                f"different resume point. This usually means one host loaded a stale local "
+                f"checkpoint while another loaded from GCS. Fix: delete local checkpoints "
+                f"(rm -rf {cfg.checkpoint_dir}) on all hosts so they all fall back to GCS."
+            )
     else:
         sync_hosts("checkpoint_loaded")
     

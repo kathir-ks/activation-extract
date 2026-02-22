@@ -28,7 +28,6 @@ class ActivationStorage:
         verbose: bool = True,
         resume_from_shard: int = 0,
         resume_from_activations: int = 0,
-        resume_from_samples: int = 0,
     ):
         """
         Initialize activation storage
@@ -44,7 +43,6 @@ class ActivationStorage:
             verbose: Print progress messages
             resume_from_shard: Continue shard numbering from this value (0 = fresh start)
             resume_from_activations: Restore total_activations counter on resume
-            resume_from_samples: Restore seen_sample count on resume
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)

@@ -119,7 +119,9 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \
     --worker=all \
     --command="
-        cd ~/$WORK_DIR && JAX_PLATFORMS=cpu python3 tests/test_code_fixes.py
+        cd ~/$WORK_DIR && JAX_PLATFORMS=cpu python3 tests/test_code_fixes.py && \
+        echo '' && echo '--- Resume & Streams Tests ---' && \
+        JAX_PLATFORMS=cpu python3 -m unittest tests.test_resume_and_streams -v
     "
 
 UNIT_EXIT=$?

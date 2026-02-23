@@ -688,14 +688,41 @@ def run_extraction(cfg):
         elif checkpoint and checkpoint.get('status') == 'completed':
             if host_info['is_primary']:
                 print(f"\n✅ Checkpoint shows extraction already completed. Skipping.")
-            return
+            # Use a sentinel so the barrier below can verify ALL hosts agree
+            start_sample_idx = -1  # signals "completed"
 
-    # Validate all hosts resume from the same point
+    # Validate all hosts resume from the same point.
+    # Each host uses start_sample_idx in the barrier name — if any host has a
+    # different value (e.g. stale local checkpoint vs fresh GCS checkpoint),
+    # the barrier will timeout because not all hosts reach the same barrier name.
+    if host_info['is_primary']:
+        print(f"  Checkpoint sync: host {host_info['host_id']} resuming from sample {start_sample_idx}")
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-        barrier(f"checkpoint_loaded_at_{start_sample_idx}", timeout=120)
+        barrier_name = f"checkpoint_loaded_at_{start_sample_idx}"
+        passed = barrier(barrier_name, timeout=120)
+        if not passed:
+            msg = (
+                f"\n{'='*60}\n"
+                f"CHECKPOINT MISMATCH DETECTED (Host {host_info['host_id']})\n"
+                f"{'='*60}\n"
+                f"This host wants to resume from sample {start_sample_idx},\n"
+                f"but other hosts are at a different point.\n\n"
+                f"This usually means one host loaded a stale local checkpoint\n"
+                f"while others loaded from GCS (or vice versa).\n\n"
+                f"Fix: Delete local checkpoints on all hosts and retry:\n"
+                f"  rm -rf {cfg.checkpoint_dir}/checkpoint_*.json\n"
+                f"The pipeline will then load from GCS consistently.\n"
+                f"{'='*60}\n"
+            )
+            print(msg, flush=True)
+            raise RuntimeError(f"Checkpoint mismatch: host {host_info['host_id']} at sample {start_sample_idx}")
     else:
         sync_hosts("checkpoint_loaded")
-    
+
+    # If ALL hosts agreed on "completed", exit now (after the barrier)
+    if start_sample_idx == -1:
+        return
+
     # =========================================================================
     # Step 4: Load dataset (each host loads full dataset, then filters)
     # =========================================================================

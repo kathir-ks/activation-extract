@@ -412,7 +412,7 @@ def main():
     parser.add_argument('--model_path', type=str, default="Qwen/Qwen2.5-0.5B")
     
     # Dataset args
-    parser.add_argument('--dataset_path', type=str, required=True,
+    parser.add_argument('--dataset_path', type=str, default="",
                         help="Path to JSONL dataset")
     parser.add_argument('--max_tasks', type=int, help="Maximum tasks to process")
     

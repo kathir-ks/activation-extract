@@ -67,6 +67,10 @@ def load_arc_dataset_jsonl(
                 else:
                     task_id = f"task_{line_idx:08x}"
 
+                # Ensure unique key: fall back to line index if task_id already seen
+                if task_id in tasks:
+                    task_id = f"task_{line_idx:08x}"
+
                 # Store task data
                 task_data = {
                     "train": task_obj["train"],

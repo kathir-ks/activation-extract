@@ -93,12 +93,12 @@ def write_stream_worker(args):
     Worker function to write a single stream file.
 
     Args:
-        args: Tuple of (stream_id, samples, column_name, output_path, base_task_id)
+        args: Tuple of (stream_id, samples, column_name, output_path, base_task_id, num_streams)
 
     Returns:
         Tuple of (stream_id, num_written, num_invalid)
     """
-    stream_id, samples, column_name, output_path, base_task_id = args
+    stream_id, samples, column_name, output_path, base_task_id, num_streams = args
 
     filepath = Path(output_path) / f"stream_{stream_id:03d}.jsonl"
     num_written = 0
@@ -106,7 +106,8 @@ def write_stream_worker(args):
 
     with open(filepath, 'w') as f:
         for i, sample in enumerate(samples):
-            task_id = f"task_{base_task_id + i:08x}"
+            # Samples are distributed round-robin: global index = stream_id + i * num_streams
+            task_id = f"task_{base_task_id + i * num_streams:08x}"
             arc_task = convert_sample_to_arc_format(sample, column_name, task_id)
 
             if arc_task:
@@ -190,15 +191,17 @@ def create_streams(
         print(f"\nStep 3: Writing streams in parallel with {num_workers} workers...")
 
     # Prepare arguments for each worker
+    # Each stream gets globally unique task IDs:
+    # stream s, sample i → global index = s + i * num_streams
     worker_args = []
-    base_task_id = 0
     for stream_id in range(num_streams):
         worker_args.append((
             stream_id,
             stream_samples[stream_id],
             column_name,
             str(output_path),
-            stream_id  # Use stream_id as base for unique task IDs
+            stream_id,    # base_task_id = stream_id (starting offset)
+            num_streams   # stride = num_streams (for round-robin global index)
         ))
 
     # Process in parallel

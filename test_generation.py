@@ -73,7 +73,7 @@ def main():
     print("Loading model weights (bfloat16)...")
     t0 = time.time()
     hf_model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        args.model_path, dtype=torch.bfloat16, trust_remote_code=True
     )
     hf_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 

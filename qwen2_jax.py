@@ -505,7 +505,10 @@ def convert_hf_to_jax_weights(hf_model, config):
         ValueError: If any expected weight is missing from the HF model state dict.
     """
     jax_params = {}
-    state_dict = hf_model.state_dict()
+    # Cast to float32 before .numpy() — bfloat16 tensors can't be converted to
+    # numpy directly. Flax Dense layers with dtype=bfloat16 cast params to bf16
+    # at compute time, so float32 storage here is correct.
+    state_dict = {k: v.float() for k, v in hf_model.state_dict().items()}
     
     # Convert embeddings
     if 'model.embed_tokens.weight' not in state_dict:

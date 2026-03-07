@@ -792,7 +792,7 @@ def run_extraction(cfg):
     # Load HF model and convert (all hosts do this)
     hf_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True
     )
     

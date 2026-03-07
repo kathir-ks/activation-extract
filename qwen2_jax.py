@@ -45,7 +45,7 @@ class QwenConfig:
     use_sliding_window: bool = False
     sliding_window: int = 32768
     use_fixed_cache: bool = False  # Use MaxText-style fixed-size cache
-    dtype: Any = struct.field(pytree_node=False, default=jnp.float32)
+    dtype: Any = struct.field(pytree_node=False, default=jnp.bfloat16)
 
 
 def rotate_half(x):

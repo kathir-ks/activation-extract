@@ -199,15 +199,16 @@ def create_prompts_from_dataset(
 
     prompts = []
 
+    from itertools import product
+    data_augmentation_params = list(product([False, True], [0, 1, 2, 3]))
+    num_augmentations = len(data_augmentation_params)
+    repeats_per_aug = max(1, predictions_per_task // num_augmentations)
+    target_per_task = predictions_per_task
+
     for task_id, task in tqdm(tasks.items(), total=len(tasks),
                               desc='Creating prompts', disable=not verbose):
-        # Data augmentation parameters
-        from itertools import product
-        data_augmentation_params = list(product([False, True], [0, 1, 2, 3]))
-        num_augmentations = len(data_augmentation_params)
-
-        # Calculate how many times to repeat each augmentation
-        repeats_per_aug = max(1, predictions_per_task // num_augmentations)
+        task_prompt_count = 0
+        target = target_per_task * len(task['test'])
 
         for hflip, n_rot90 in data_augmentation_params:
             for _ in range(repeats_per_aug):
@@ -234,9 +235,10 @@ def create_prompts_from_dataset(
                         'prompt': prompt,
                         'idx': idx
                     })
+                    task_prompt_count += 1
 
-            # Break early if we have enough
-            if len(prompts) >= predictions_per_task * len(task['test']):
+            # Break early once we have enough prompts for this task
+            if task_prompt_count >= target:
                 break
 
     return prompts

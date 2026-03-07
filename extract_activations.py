@@ -382,6 +382,7 @@ def main():
             max_position_embeddings=hf_config.max_position_embeddings,
             rms_norm_eps=hf_config.rms_norm_eps,
             rope_theta=getattr(hf_config, 'rope_theta', None) or hf_config.rope_parameters.get('rope_theta', 1000000.0),
+            dtype=jnp.bfloat16,
         )
         print(f"  ✓ Detected {config.num_hidden_layers} layers, {config.hidden_size} hidden size")
 
@@ -401,7 +402,7 @@ def main():
     print(f"Loading HF model...")
     hf_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_path,
-        torch_dtype=torch.float32,
+        dtype=torch.bfloat16,
         trust_remote_code=True
     )
 

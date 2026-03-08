@@ -13,3 +13,8 @@
 **/*.hdf5
 **/*.zip
 **/*.tar
+checkpoints/
+activations/
+activations_dryrun/
+dataset_streams/
+nohup.out

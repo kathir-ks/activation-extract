@@ -39,6 +39,13 @@ from .dynamic_batching import (
     DEFAULT_BATCH_SIZES,
 )
 
+from .grid_chunking import (
+    create_grid_token_stream,
+    chunk_token_stream,
+    create_grid_chunks_from_dataset,
+    ChunkMetadata,
+)
+
 from .mesh_configs import (
     TopologyConfig,
     TPU_TOPOLOGIES,
@@ -95,4 +102,10 @@ __all__ = [
     'DynamicBatch',
     'DEFAULT_LENGTH_BUCKETS',
     'DEFAULT_BATCH_SIZES',
+
+    # Grid chunking
+    'create_grid_token_stream',
+    'chunk_token_stream',
+    'create_grid_chunks_from_dataset',
+    'ChunkMetadata',
 ]

@@ -56,6 +56,7 @@ from core import (
     create_dynamic_batches,
     pad_batch_to_bucket,
     DynamicBatch,
+    create_grid_chunks_from_dataset,
 )
 
 # Import new multihost utilities
@@ -124,7 +125,8 @@ class MultihostExtractionConfig:
     layers_to_extract: Optional[List[int]] = None
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 32  # Global batch size across all hosts
-    max_seq_length: int = 32768  # Hard cap; sequences exceeding this are filtered out
+    max_seq_length: int = 2048  # Fixed sequence length (model's trained context window)
+    pipeline: str = 'prompt'  # 'prompt' or 'grid_chunking'
     fsdp_size: Optional[int] = None  # FSDP axis size (default: min(2, local_devices))
     
     # Output config
@@ -448,8 +450,11 @@ def main():
     parser.add_argument('--layers_to_extract', type=int, nargs='+')
     parser.add_argument('--activation_type', type=str, default='residual',
                         choices=['residual', 'mlp', 'attn'])
-    parser.add_argument('--max_seq_length', type=int, default=32768,
-                        help="Hard cap on sequence length; longer sequences are filtered out (default: 32768)")
+    parser.add_argument('--max_seq_length', type=int, default=2048,
+                        help="Fixed sequence length for chunks/batches (default: 2048)")
+    parser.add_argument('--pipeline', type=str, default='prompt',
+                        choices=['prompt', 'grid_chunking'],
+                        help="Data pipeline: 'prompt' (full prompts) or 'grid_chunking' (grid-only chunks for SAE)")
     parser.add_argument('--fsdp_size', type=int, default=None,
                         help="FSDP axis size for 3D mesh (default: min(2, local_devices))")
 
@@ -861,46 +866,67 @@ def run_extraction(cfg):
         sync_hosts("sharding_complete")
     
     # =========================================================================
-    # Step 6: Create prompts and tokenize
+    # Step 6: Create prompts/chunks and tokenize
     # =========================================================================
-
-    if host_info['is_primary'] and cfg.verbose:
-        print(f"\nCreating prompts...")
 
     grid_encoder = create_grid_encoder(cfg.grid_encoder)
-    prompts_data = create_prompts_from_dataset(
-        tasks,
-        grid_encoder,
-        tokenizer,
-        cfg.prompt_version,
-        cfg.predictions_per_task,
-        cfg.random_seed,
-        verbose=host_info['is_primary'] and cfg.verbose
-    )
 
-    if host_info['is_primary'] and cfg.verbose:
-        print(f"Tokenizing {len(prompts_data)} prompts...")
+    if cfg.pipeline == 'grid_chunking':
+        # Grid chunking pipeline: strip text, continuous grid token stream, fixed chunks
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"\nUsing grid chunking pipeline (chunk_size={cfg.max_seq_length})")
 
-    sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
+        chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
+            tasks=tasks,
+            grid_encoder=grid_encoder,
+            tokenizer=tokenizer,
+            chunk_size=cfg.max_seq_length,
+            predictions_per_task=cfg.predictions_per_task,
+            random_seed=cfg.random_seed,
+            verbose=host_info['is_primary'] and cfg.verbose,
+        )
+        sequences = chunks
+        prompts_data = [
+            {'task_id': f'chunk_{m.chunk_idx}', 'prompt': f'grid_chunk_{m.chunk_idx}'}
+            for m in chunk_metadata
+        ]
+        dynamic_batches = None
+        use_fixed_batching = True
+    else:
+        # Standard prompt pipeline
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"\nCreating prompts...")
 
-    # =========================================================================
-    # Step 6b: Dynamic batching — sort by length, group into buckets
-    # =========================================================================
+        prompts_data = create_prompts_from_dataset(
+            tasks,
+            grid_encoder,
+            tokenizer,
+            cfg.prompt_version,
+            cfg.predictions_per_task,
+            cfg.random_seed,
+            verbose=host_info['is_primary'] and cfg.verbose
+        )
 
-    if host_info['is_primary'] and cfg.verbose:
-        print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"Tokenizing {len(prompts_data)} prompts...")
 
-    dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
-        sequences,
-        prompts_data,
-        max_seq_length=cfg.max_seq_length,
-        num_hosts=host_info['num_hosts'],
-        verbose=host_info['is_primary'] and cfg.verbose,
-    )
+        sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
 
-    # Replace with sorted/filtered versions for consistent indexing
-    sequences = sorted_sequences
-    prompts_data = sorted_prompts
+        # Dynamic batching: sort by length, group into buckets
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
+
+        dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
+            sequences,
+            prompts_data,
+            max_seq_length=cfg.max_seq_length,
+            num_hosts=host_info['num_hosts'],
+            verbose=host_info['is_primary'] and cfg.verbose,
+        )
+
+        sequences = sorted_sequences
+        prompts_data = sorted_prompts
+        use_fixed_batching = False
 
     # =========================================================================
     # Step 7: Initialize storage (each host writes its own shards)
@@ -928,13 +954,20 @@ def run_extraction(cfg):
     # Step 8: Process batches with multihost coordination
     # =========================================================================
 
-    total_sequences = sum(len(b.sequences) for b in dynamic_batches)
+    if use_fixed_batching:
+        total_sequences = len(sequences)
+        num_batches = (total_sequences + cfg.batch_size - 1) // cfg.batch_size
+    else:
+        total_sequences = sum(len(b.sequences) for b in dynamic_batches)
+        num_batches = len(dynamic_batches)
+
     if host_info['is_primary']:
+        pipeline_label = "grid chunking, fixed batching" if use_fixed_batching else "dynamic batching"
         print(f"\n{'='*70}")
-        print(f"EXTRACTING ACTIVATIONS (dynamic batching)")
+        print(f"EXTRACTING ACTIVATIONS ({pipeline_label})")
         print(f"{'='*70}")
         print(f"  Total samples: {total_sequences}")
-        print(f"  Total batches: {len(dynamic_batches)}")
+        print(f"  Total batches: {num_batches}")
         print(f"  Starting from sample: {start_sample_idx}")
         print(f"{'='*70}")
 
@@ -954,64 +987,93 @@ def run_extraction(cfg):
     last_saved_shard_count = 0
     global_sample_offset = 0  # Tracks position in the sorted sequence list
 
-    with mesh:
-        pbar = tqdm(
-            dynamic_batches,
-            desc=f"Host {host_info['host_id']}",
-            disable=not (host_info['is_primary'] and cfg.verbose)
-        )
-
-        for batch in pbar:
-            global_start = global_sample_offset
-            global_end = global_start + len(batch.sequences)
-            global_sample_offset = global_end
-
-            # Skip if all samples in this batch have been processed (resume)
-            if global_end <= start_sample_idx:
-                continue
-
-            batch_sample_indices = list(range(global_start, global_end))
-
-            process_batch_multihost(
-                jax_model, params, batch.sequences, batch_sample_indices,
-                prompts_data, storage, cfg.layers_to_extract,
-                tokenizer.pad_token_id or 0,
-                batch.batch_size,
-                batch.bucket_size,  # Pad to bucket size, not a fixed max
-                host_info,
-                mesh=mesh,
-                sharding_specs=sharding_specs,
-                actual_lengths=batch.actual_lengths,
+    def _save_checkpoint_if_needed(global_end, pbar=None, bucket_size=None):
+        nonlocal last_saved_shard_count
+        if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
+            ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
+            save_checkpoint_multihost(
+                checkpoint_data={
+                    'topology': cfg.topology,
+                    'host_id': host_info['host_id'],
+                    'last_processed_sample_idx': global_end - 1,
+                    'total_samples_processed': global_end,
+                    'total_shards': storage.shard_count,
+                    'total_activations': storage.total_activations,
+                    'dataset_path': cfg.dataset_path,
+                    'model_path': cfg.model_path,
+                },
+                checkpoint_dir=cfg.checkpoint_dir,
+                topology=cfg.topology,
+                host_id=host_info['host_id'],
+                gcs_bucket=ckpt_gcs_bucket,
+                gcs_prefix=cfg.checkpoint_gcs_prefix,
             )
+            last_saved_shard_count = storage.shard_count
+            if host_info['is_primary'] and cfg.verbose and pbar:
+                postfix = {'shards': storage.shard_count}
+                if bucket_size:
+                    postfix['bucket'] = bucket_size
+                pbar.set_postfix(postfix)
 
-            # Checkpoint after shard creation (each host saves independently)
-            if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
-                ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
-                save_checkpoint_multihost(
-                    checkpoint_data={
-                        'topology': cfg.topology,
-                        'host_id': host_info['host_id'],
-                        'last_processed_sample_idx': global_end - 1,
-                        'total_samples_processed': global_end,
-                        'total_shards': storage.shard_count,
-                        'total_activations': storage.total_activations,
-                        'dataset_path': cfg.dataset_path,
-                        'model_path': cfg.model_path,
-                    },
-                    checkpoint_dir=cfg.checkpoint_dir,
-                    topology=cfg.topology,
-                    host_id=host_info['host_id'],
-                    gcs_bucket=ckpt_gcs_bucket,
-                    gcs_prefix=cfg.checkpoint_gcs_prefix,
+    with mesh:
+        if use_fixed_batching:
+            # Grid chunking: simple fixed-size batching
+            pbar = tqdm(
+                range(num_batches),
+                desc=f"Host {host_info['host_id']}",
+                disable=not (host_info['is_primary'] and cfg.verbose)
+            )
+            for batch_idx in pbar:
+                global_start = batch_idx * cfg.batch_size
+                global_end = min(global_start + cfg.batch_size, total_sequences)
+                batch_sequences = sequences[global_start:global_end]
+
+                if global_end <= start_sample_idx:
+                    continue
+
+                batch_sample_indices = list(range(global_start, global_end))
+
+                process_batch_multihost(
+                    jax_model, params, batch_sequences, batch_sample_indices,
+                    prompts_data, storage, cfg.layers_to_extract,
+                    tokenizer.pad_token_id or 0,
+                    cfg.batch_size,
+                    cfg.max_seq_length,
+                    host_info,
+                    mesh=mesh,
+                    sharding_specs=sharding_specs,
+                    actual_lengths=None,
                 )
+                _save_checkpoint_if_needed(global_end, pbar)
+        else:
+            # Dynamic batching for standard prompt pipeline
+            pbar = tqdm(
+                dynamic_batches,
+                desc=f"Host {host_info['host_id']}",
+                disable=not (host_info['is_primary'] and cfg.verbose)
+            )
+            for batch in pbar:
+                global_start = global_sample_offset
+                global_end = global_start + len(batch.sequences)
+                global_sample_offset = global_end
 
-                last_saved_shard_count = storage.shard_count
+                if global_end <= start_sample_idx:
+                    continue
 
-                if host_info['is_primary'] and cfg.verbose:
-                    pbar.set_postfix({
-                        'shards': storage.shard_count,
-                        'bucket': batch.bucket_size,
-                    })
+                batch_sample_indices = list(range(global_start, global_end))
+
+                process_batch_multihost(
+                    jax_model, params, batch.sequences, batch_sample_indices,
+                    prompts_data, storage, cfg.layers_to_extract,
+                    tokenizer.pad_token_id or 0,
+                    batch.batch_size,
+                    batch.bucket_size,
+                    host_info,
+                    mesh=mesh,
+                    sharding_specs=sharding_specs,
+                    actual_lengths=batch.actual_lengths,
+                )
+                _save_checkpoint_if_needed(global_end, pbar, batch.bucket_size)
     
     # =========================================================================
     # Step 9: Finalize

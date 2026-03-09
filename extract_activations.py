@@ -69,6 +69,7 @@ from core import (
     P,
     create_dynamic_batches,
     DynamicBatch,
+    create_grid_chunks_from_dataset,
 )
 
 # Import model utilities
@@ -139,7 +140,8 @@ class ExtractionConfig:
     layers_to_extract: Optional[List[int]] = None
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 4
-    max_seq_length: int = 32768  # Hard cap; sequences exceeding this are filtered out
+    max_seq_length: int = 2048  # Fixed sequence length (model's trained context window)
+    pipeline: str = 'prompt'  # 'prompt' or 'grid_chunking'
 
     # Output config
     output_dir: str = './activations'
@@ -284,8 +286,12 @@ def main():
                         choices=['residual', 'mlp', 'attn'],
                         help="Type of activation to extract: 'residual' (layer output after both residuals), "
                              "'mlp' (MLP output before residual), 'attn' (attention output before residual)")
-    parser.add_argument('--max_seq_length', type=int, default=32768,
-                        help="Hard cap on sequence length; longer sequences are filtered out (default: 32768)")
+    parser.add_argument('--max_seq_length', type=int, default=2048,
+                        help="Fixed sequence length for chunks/batches (default: 2048)")
+    parser.add_argument('--pipeline', type=str, default='prompt',
+                        choices=['prompt', 'grid_chunking'],
+                        help="Data pipeline: 'prompt' (full prompts with text) or "
+                             "'grid_chunking' (grid-only continuous chunks for SAE training)")
 
     # Output args
     parser.add_argument('--output_dir', type=str)
@@ -439,35 +445,58 @@ def main():
     print(f"\nCreating grid encoder: {cfg.grid_encoder}")
     grid_encoder = create_grid_encoder(cfg.grid_encoder)
 
-    # Create prompts
-    print(f"\nCreating prompts...")
-    prompts_data = create_prompts_from_dataset(
-        tasks,
-        grid_encoder,
-        tokenizer,
-        cfg.prompt_version,
-        cfg.predictions_per_task,
-        cfg.random_seed,
-        cfg.verbose
-    )
+    if cfg.pipeline == 'grid_chunking':
+        # Grid chunking pipeline: strip text, continuous grid token stream, fixed chunks
+        print(f"\nUsing grid chunking pipeline (chunk_size={cfg.max_seq_length})")
+        chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
+            tasks=tasks,
+            grid_encoder=grid_encoder,
+            tokenizer=tokenizer,
+            chunk_size=cfg.max_seq_length,
+            predictions_per_task=cfg.predictions_per_task,
+            random_seed=cfg.random_seed,
+            verbose=cfg.verbose,
+        )
+        # All chunks are already padded to max_seq_length — use fixed batching
+        sequences = chunks
+        prompts_data = [
+            {'task_id': f'chunk_{m.chunk_idx}', 'prompt': f'grid_chunk_{m.chunk_idx}'}
+            for m in chunk_metadata
+        ]
+        # Build simple fixed-size batches (no dynamic batching needed)
+        dynamic_batches = None
+        use_fixed_batching = True
+    else:
+        # Standard prompt pipeline
+        print(f"\nCreating prompts...")
+        prompts_data = create_prompts_from_dataset(
+            tasks,
+            grid_encoder,
+            tokenizer,
+            cfg.prompt_version,
+            cfg.predictions_per_task,
+            cfg.random_seed,
+            cfg.verbose
+        )
 
-    # Tokenize
-    print(f"\nTokenizing {len(prompts_data)} prompts...")
-    sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
+        # Tokenize
+        print(f"\nTokenizing {len(prompts_data)} prompts...")
+        sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
 
-    # Dynamic batching: sort by length, group into buckets, filter long sequences
-    print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
-    dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
-        sequences,
-        prompts_data,
-        max_seq_length=cfg.max_seq_length,
-        num_hosts=1,
-        verbose=cfg.verbose,
-    )
+        # Dynamic batching: sort by length, group into buckets, filter long sequences
+        print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
+        dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
+            sequences,
+            prompts_data,
+            max_seq_length=cfg.max_seq_length,
+            num_hosts=1,
+            verbose=cfg.verbose,
+        )
 
-    # Replace with sorted/filtered versions
-    sequences = sorted_sequences
-    prompts_data = sorted_prompts
+        # Replace with sorted/filtered versions
+        sequences = sorted_sequences
+        prompts_data = sorted_prompts
+        use_fixed_batching = False
 
     # Initialize storage
     storage = ActivationStorage(
@@ -482,50 +511,96 @@ def main():
     )
 
     # Process batches
-    total_sequences = sum(len(b.sequences) for b in dynamic_batches)
-    print(f"\nExtracting activations (dynamic batching)...")
-    print(f"  Total samples: {total_sequences}")
-    print(f"  Total batches: {len(dynamic_batches)}")
-    print(f"  Starting from sample: {start_sample_idx}")
+    if use_fixed_batching:
+        # Grid chunking: all chunks are same size, use simple fixed batching
+        total_sequences = len(sequences)
+        num_batches = (total_sequences + cfg.batch_size - 1) // cfg.batch_size
+        print(f"\nExtracting activations (grid chunking, fixed batching)...")
+        print(f"  Total chunks: {total_sequences}")
+        print(f"  Batch size: {cfg.batch_size}")
+        print(f"  Total batches: {num_batches}")
+        print(f"  Starting from sample: {start_sample_idx}")
+    else:
+        total_sequences = sum(len(b.sequences) for b in dynamic_batches)
+        num_batches = len(dynamic_batches)
+        print(f"\nExtracting activations (dynamic batching)...")
+        print(f"  Total samples: {total_sequences}")
+        print(f"  Total batches: {num_batches}")
+        print(f"  Starting from sample: {start_sample_idx}")
 
     last_saved_shard_count = checkpoint.get('total_shards', 0)
     global_sample_offset = 0
 
     context = mesh if mesh is not None else open(os.devnull)
     with context:
-        for batch in tqdm(dynamic_batches, desc="Processing batches", disable=not cfg.verbose):
-            global_start = global_sample_offset
-            global_end = global_start + len(batch.sequences)
-            global_sample_offset = global_end
+        if use_fixed_batching:
+            # Simple fixed-size batching for grid chunks
+            for batch_idx in tqdm(range(num_batches), desc="Processing batches", disable=not cfg.verbose):
+                global_start = batch_idx * cfg.batch_size
+                global_end = min(global_start + cfg.batch_size, total_sequences)
+                batch_sequences = sequences[global_start:global_end]
 
-            # Skip if all samples in this batch have been processed
-            if global_end <= start_sample_idx:
-                continue
+                # Skip if all samples in this batch have been processed
+                if global_end <= start_sample_idx:
+                    continue
 
-            batch_sample_indices = list(range(global_start, global_end))
+                batch_sample_indices = list(range(global_start, global_end))
 
-            process_batch(
-                jax_model, params, batch.sequences, batch_sample_indices,
-                prompts_data, storage, cfg.layers_to_extract,
-                tokenizer.pad_token_id or 0,
-                batch.batch_size, batch.bucket_size,
-                actual_lengths=batch.actual_lengths,
-            )
+                process_batch(
+                    jax_model, params, batch_sequences, batch_sample_indices,
+                    prompts_data, storage, cfg.layers_to_extract,
+                    tokenizer.pad_token_id or 0,
+                    cfg.batch_size, cfg.max_seq_length,
+                    actual_lengths=None,  # Chunks are pre-padded to exact size
+                )
 
-            # Save checkpoint if new shard was created (detected by increase in shard count)
-            if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
-                checkpoint_data = {
-                    'worker_id': cfg.worker_id,
-                    'last_processed_sample_idx': global_end - 1,
-                    'total_samples_processed': global_end,
-                    'total_shards': storage.shard_count,
-                    'dataset_path': cfg.dataset_path,
-                    'model_path': cfg.model_path,
-                }
-                save_checkpoint(checkpoint_path, checkpoint_data)
-                last_saved_shard_count = storage.shard_count
-                if cfg.verbose:
-                    print(f"\n  💾 Checkpoint saved: sample {end_idx - 1}, {storage.shard_count} shards")
+                if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
+                    checkpoint_data = {
+                        'worker_id': cfg.worker_id,
+                        'last_processed_sample_idx': global_end - 1,
+                        'total_samples_processed': global_end,
+                        'total_shards': storage.shard_count,
+                        'dataset_path': cfg.dataset_path,
+                        'model_path': cfg.model_path,
+                    }
+                    save_checkpoint(checkpoint_path, checkpoint_data)
+                    last_saved_shard_count = storage.shard_count
+                    if cfg.verbose:
+                        print(f"\n  Checkpoint saved: sample {global_end - 1}, {storage.shard_count} shards")
+        else:
+            # Dynamic batching for standard prompt pipeline
+            for batch in tqdm(dynamic_batches, desc="Processing batches", disable=not cfg.verbose):
+                global_start = global_sample_offset
+                global_end = global_start + len(batch.sequences)
+                global_sample_offset = global_end
+
+                # Skip if all samples in this batch have been processed
+                if global_end <= start_sample_idx:
+                    continue
+
+                batch_sample_indices = list(range(global_start, global_end))
+
+                process_batch(
+                    jax_model, params, batch.sequences, batch_sample_indices,
+                    prompts_data, storage, cfg.layers_to_extract,
+                    tokenizer.pad_token_id or 0,
+                    batch.batch_size, batch.bucket_size,
+                    actual_lengths=batch.actual_lengths,
+                )
+
+                if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
+                    checkpoint_data = {
+                        'worker_id': cfg.worker_id,
+                        'last_processed_sample_idx': global_end - 1,
+                        'total_samples_processed': global_end,
+                        'total_shards': storage.shard_count,
+                        'dataset_path': cfg.dataset_path,
+                        'model_path': cfg.model_path,
+                    }
+                    save_checkpoint(checkpoint_path, checkpoint_data)
+                    last_saved_shard_count = storage.shard_count
+                    if cfg.verbose:
+                        print(f"\n  Checkpoint saved: sample {global_end - 1}, {storage.shard_count} shards")
 
     # Finalize
     storage.finalize()

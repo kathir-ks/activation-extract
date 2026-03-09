@@ -125,7 +125,7 @@ class MultihostExtractionConfig:
     layers_to_extract: Optional[List[int]] = None
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 32  # Global batch size across all hosts
-    max_seq_length: int = 2048  # Fixed sequence length (model's trained context window)
+    max_seq_length: int = 5120  # Fixed sequence length for grid chunks
     pipeline: str = 'prompt'  # 'prompt' or 'grid_chunking'
     fsdp_size: Optional[int] = None  # FSDP axis size (default: min(2, local_devices))
     
@@ -450,8 +450,8 @@ def main():
     parser.add_argument('--layers_to_extract', type=int, nargs='+')
     parser.add_argument('--activation_type', type=str, default='residual',
                         choices=['residual', 'mlp', 'attn'])
-    parser.add_argument('--max_seq_length', type=int, default=2048,
-                        help="Fixed sequence length for chunks/batches (default: 2048)")
+    parser.add_argument('--max_seq_length', type=int, default=5120,
+                        help="Fixed sequence length for chunks/batches (default: 5120)")
     parser.add_argument('--pipeline', type=str, default='prompt',
                         choices=['prompt', 'grid_chunking'],
                         help="Data pipeline: 'prompt' (full prompts) or 'grid_chunking' (grid-only chunks for SAE)")

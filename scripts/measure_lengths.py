@@ -29,7 +29,8 @@ sample_indices = np.linspace(0, len(lines) - 1, 1000, dtype=int)
 tasks = {}
 for i in sample_indices:
     data = json.loads(lines[i])
-    tasks[data["id"]] = data
+    task_id = data.get("task_id", data.get("id", f"task_{i}"))
+    tasks[task_id] = data
 
 # Create 1 prompt per task (no augmentation, measure raw lengths)
 lengths = []

@@ -66,7 +66,9 @@ from core import (
     load_arc_dataset_from_shard,
     create_prompts_from_dataset,
     ActivationStorage,
-    P
+    P,
+    create_dynamic_batches,
+    DynamicBatch,
 )
 
 # Import model utilities
@@ -137,7 +139,7 @@ class ExtractionConfig:
     layers_to_extract: Optional[List[int]] = None
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 4
-    max_seq_length: int = 2048
+    max_seq_length: int = 32768  # Hard cap; sequences exceeding this are filtered out
 
     # Output config
     output_dir: str = './activations'
@@ -197,9 +199,15 @@ def process_batch(
     layers_to_extract: List[int],
     pad_token_id: int,
     batch_size: Optional[int] = None,
-    max_seq_length: Optional[int] = None
+    max_seq_length: Optional[int] = None,
+    actual_lengths: Optional[List[int]] = None,
 ):
-    """Process a single batch of sequences"""
+    """Process a single batch of sequences.
+
+    Args:
+        actual_lengths: If provided, only store activations for the first
+            actual_lengths[i] tokens of each sequence (skip padding tokens).
+    """
     # Pad batch dimension if needed
     actual_batch_size = len(sequences)
     if batch_size is not None and actual_batch_size < batch_size:
@@ -213,7 +221,7 @@ def process_batch(
     # Forward pass (JIT-compiled)
     activations = extract_activations_sharded(model, params, input_ids)
 
-    # Async device→host transfer for all layers
+    # Async device-to-host transfer for all layers
     host_activations = {}
     for layer_idx in layers_to_extract:
         layer_key = f'layer_{layer_idx}'
@@ -228,6 +236,9 @@ def process_batch(
             if layer_key in host_activations:
                 layer_act = host_activations[layer_key][i]
                 layer_act_np = np.array(layer_act)
+                # Crop padding: only store activations for actual tokens
+                if actual_lengths is not None and i < len(actual_lengths):
+                    layer_act_np = layer_act_np[:actual_lengths[i]]
                 storage.add_activation(
                     layer_idx=layer_idx,
                     activation=layer_act_np,
@@ -273,7 +284,8 @@ def main():
                         choices=['residual', 'mlp', 'attn'],
                         help="Type of activation to extract: 'residual' (layer output after both residuals), "
                              "'mlp' (MLP output before residual), 'attn' (attention output before residual)")
-    parser.add_argument('--max_seq_length', type=int, default=2048)
+    parser.add_argument('--max_seq_length', type=int, default=32768,
+                        help="Hard cap on sequence length; longer sequences are filtered out (default: 32768)")
 
     # Output args
     parser.add_argument('--output_dir', type=str)
@@ -443,6 +455,20 @@ def main():
     print(f"\nTokenizing {len(prompts_data)} prompts...")
     sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
 
+    # Dynamic batching: sort by length, group into buckets, filter long sequences
+    print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
+    dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
+        sequences,
+        prompts_data,
+        max_seq_length=cfg.max_seq_length,
+        num_hosts=1,
+        verbose=cfg.verbose,
+    )
+
+    # Replace with sorted/filtered versions
+    sequences = sorted_sequences
+    prompts_data = sorted_prompts
+
     # Initialize storage
     storage = ActivationStorage(
         output_dir=cfg.output_dir,
@@ -456,47 +482,42 @@ def main():
     )
 
     # Process batches
-    print(f"\nExtracting activations...")
-    print(f"  Total samples: {len(sequences)}")
+    total_sequences = sum(len(b.sequences) for b in dynamic_batches)
+    print(f"\nExtracting activations (dynamic batching)...")
+    print(f"  Total samples: {total_sequences}")
+    print(f"  Total batches: {len(dynamic_batches)}")
     print(f"  Starting from sample: {start_sample_idx}")
-    print(f"  Batch size: {cfg.batch_size}")
 
-    num_batches = (len(sequences) + cfg.batch_size - 1) // cfg.batch_size
     last_saved_shard_count = checkpoint.get('total_shards', 0)
+    global_sample_offset = 0
 
     context = mesh if mesh is not None else open(os.devnull)
     with context:
-        for batch_idx in tqdm(range(num_batches), desc="Processing batches", disable=not cfg.verbose):
-            start_idx = batch_idx * cfg.batch_size
-            end_idx = min(start_idx + cfg.batch_size, len(sequences))
+        for batch in tqdm(dynamic_batches, desc="Processing batches", disable=not cfg.verbose):
+            global_start = global_sample_offset
+            global_end = global_start + len(batch.sequences)
+            global_sample_offset = global_end
 
             # Skip if all samples in this batch have been processed
-            if end_idx <= start_sample_idx:
+            if global_end <= start_sample_idx:
                 continue
 
-            # Skip already processed samples within the batch
-            if start_idx < start_sample_idx:
-                # Partial batch: some samples already processed
-                batch_sequences = sequences[start_sample_idx:end_idx]
-                batch_sample_indices = list(range(start_sample_idx, end_idx))
-            else:
-                # Full batch: no samples processed yet
-                batch_sequences = sequences[start_idx:end_idx]
-                batch_sample_indices = list(range(start_idx, end_idx))
+            batch_sample_indices = list(range(global_start, global_end))
 
             process_batch(
-                jax_model, params, batch_sequences, batch_sample_indices,
+                jax_model, params, batch.sequences, batch_sample_indices,
                 prompts_data, storage, cfg.layers_to_extract,
                 tokenizer.pad_token_id or 0,
-                cfg.batch_size, cfg.max_seq_length
+                batch.batch_size, batch.bucket_size,
+                actual_lengths=batch.actual_lengths,
             )
 
             # Save checkpoint if new shard was created (detected by increase in shard count)
             if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
                 checkpoint_data = {
                     'worker_id': cfg.worker_id,
-                    'last_processed_sample_idx': end_idx - 1,
-                    'total_samples_processed': end_idx,
+                    'last_processed_sample_idx': global_end - 1,
+                    'total_samples_processed': global_end,
                     'total_shards': storage.shard_count,
                     'dataset_path': cfg.dataset_path,
                     'model_path': cfg.model_path,

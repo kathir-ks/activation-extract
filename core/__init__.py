@@ -31,6 +31,14 @@ from .dataset_utils import (
 
 from .activation_storage import ActivationStorage, load_activation_shard
 
+from .dynamic_batching import (
+    create_dynamic_batches,
+    pad_batch_to_bucket,
+    DynamicBatch,
+    DEFAULT_LENGTH_BUCKETS,
+    DEFAULT_BATCH_SIZES,
+)
+
 from .mesh_configs import (
     TopologyConfig,
     TPU_TOPOLOGIES,
@@ -80,4 +88,11 @@ __all__ = [
     # Storage
     'ActivationStorage',
     'load_activation_shard',
+
+    # Dynamic batching
+    'create_dynamic_batches',
+    'pad_batch_to_bucket',
+    'DynamicBatch',
+    'DEFAULT_LENGTH_BUCKETS',
+    'DEFAULT_BATCH_SIZES',
 ]

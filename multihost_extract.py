@@ -52,7 +52,10 @@ from core import (
     pad_sequences,
     load_arc_dataset_jsonl,
     ActivationStorage,
-    P
+    P,
+    create_dynamic_batches,
+    pad_batch_to_bucket,
+    DynamicBatch,
 )
 
 # Import new multihost utilities
@@ -121,7 +124,7 @@ class MultihostExtractionConfig:
     layers_to_extract: Optional[List[int]] = None
     activation_type: str = 'residual'  # 'mlp', 'attn', or 'residual'
     batch_size: int = 32  # Global batch size across all hosts
-    max_seq_length: int = 2048
+    max_seq_length: int = 32768  # Hard cap; sequences exceeding this are filtered out
     fsdp_size: Optional[int] = None  # FSDP axis size (default: min(2, local_devices))
     
     # Output config
@@ -300,16 +303,24 @@ def process_batch_multihost(
     host_info: Dict,
     mesh: Optional[Mesh] = None,
     sharding_specs: Optional[Dict[str, NamedSharding]] = None,
+    actual_lengths: Optional[List[int]] = None,
 ):
-    """Process a batch of sequences with multihost coordination"""
-    
+    """Process a batch of sequences with multihost coordination.
+
+    Args:
+        actual_lengths: If provided, only store activations for the first
+            actual_lengths[i] tokens of each sequence (skip padding tokens).
+    """
+
     # Pad batch dimension if needed
     actual_batch_size = len(sequences)
     if actual_batch_size < batch_size:
         pad_count = batch_size - actual_batch_size
         sequences = sequences + [sequences[-1]] * pad_count
-    
-    # Pad sequences to fixed length
+        if actual_lengths is not None:
+            actual_lengths = actual_lengths + [actual_lengths[-1]] * pad_count
+
+    # Pad sequences to fixed length (bucket size or max_seq_length)
     padded = pad_sequences(sequences, pad_token_id=pad_token_id, fixed_length=max_seq_length)
     input_ids = jnp.array(padded)
     
@@ -358,9 +369,14 @@ def process_batch_multihost(
             for layer_idx in layers_to_extract:
                 layer_key = f'layer_{layer_idx}'
                 if layer_key in host_activations:
+                    act = host_activations[layer_key][i_local]
+                    # Crop padding: only store activations for actual tokens
+                    if actual_lengths is not None and global_i < len(actual_lengths):
+                        seq_len = actual_lengths[global_i]
+                        act = act[:seq_len]
                     storage.add_activation(
                         layer_idx=layer_idx,
-                        activation=host_activations[layer_key][i_local],
+                        activation=act,
                         sample_idx=sample_idx,
                         text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
                     )
@@ -385,9 +401,14 @@ def process_batch_multihost(
                 for layer_idx in layers_to_extract:
                     layer_key = f'layer_{layer_idx}'
                     if layer_key in host_activations:
+                        act = np.array(host_activations[layer_key][i])
+                        # Crop padding: only store activations for actual tokens
+                        if actual_lengths is not None and i < len(actual_lengths):
+                            seq_len = actual_lengths[i]
+                            act = act[:seq_len]
                         storage.add_activation(
                             layer_idx=layer_idx,
-                            activation=np.array(host_activations[layer_key][i]),
+                            activation=act,
                             sample_idx=sample_idx,
                             text_preview=f"Task: {prompt_data['task_id']}, Prompt: {prompt_data['prompt'][:100]}"
                         )
@@ -427,7 +448,8 @@ def main():
     parser.add_argument('--layers_to_extract', type=int, nargs='+')
     parser.add_argument('--activation_type', type=str, default='residual',
                         choices=['residual', 'mlp', 'attn'])
-    parser.add_argument('--max_seq_length', type=int, default=2048)
+    parser.add_argument('--max_seq_length', type=int, default=32768,
+                        help="Hard cap on sequence length; longer sequences are filtered out (default: 32768)")
     parser.add_argument('--fsdp_size', type=int, default=None,
                         help="FSDP axis size for 3D mesh (default: min(2, local_devices))")
 
@@ -841,10 +863,10 @@ def run_extraction(cfg):
     # =========================================================================
     # Step 6: Create prompts and tokenize
     # =========================================================================
-    
+
     if host_info['is_primary'] and cfg.verbose:
         print(f"\nCreating prompts...")
-    
+
     grid_encoder = create_grid_encoder(cfg.grid_encoder)
     prompts_data = create_prompts_from_dataset(
         tasks,
@@ -855,12 +877,31 @@ def run_extraction(cfg):
         cfg.random_seed,
         verbose=host_info['is_primary'] and cfg.verbose
     )
-    
+
     if host_info['is_primary'] and cfg.verbose:
         print(f"Tokenizing {len(prompts_data)} prompts...")
-    
+
     sequences = [tokenizer.encode(p['prompt']) for p in prompts_data]
-    
+
+    # =========================================================================
+    # Step 6b: Dynamic batching — sort by length, group into buckets
+    # =========================================================================
+
+    if host_info['is_primary'] and cfg.verbose:
+        print(f"\nCreating dynamic batches (max_seq_length={cfg.max_seq_length})...")
+
+    dynamic_batches, sorted_sequences, sorted_prompts = create_dynamic_batches(
+        sequences,
+        prompts_data,
+        max_seq_length=cfg.max_seq_length,
+        num_hosts=host_info['num_hosts'],
+        verbose=host_info['is_primary'] and cfg.verbose,
+    )
+
+    # Replace with sorted/filtered versions for consistent indexing
+    sequences = sorted_sequences
+    prompts_data = sorted_prompts
+
     # =========================================================================
     # Step 7: Initialize storage (each host writes its own shards)
     # =========================================================================
@@ -882,75 +923,67 @@ def run_extraction(cfg):
         resume_from_shard=resume_shard_count,
         resume_from_activations=resume_activation_count,
     )
-    
+
     # =========================================================================
     # Step 8: Process batches with multihost coordination
     # =========================================================================
-    
+
+    total_sequences = sum(len(b.sequences) for b in dynamic_batches)
     if host_info['is_primary']:
         print(f"\n{'='*70}")
-        print(f"EXTRACTING ACTIVATIONS")
+        print(f"EXTRACTING ACTIVATIONS (dynamic batching)")
         print(f"{'='*70}")
-        print(f"  Total samples: {len(sequences)}")
-        print(f"  Global batch size: {cfg.batch_size}")
-        print(f"  Per-host batch size: {cfg.batch_size // host_info['num_hosts']}")
+        print(f"  Total samples: {total_sequences}")
+        print(f"  Total batches: {len(dynamic_batches)}")
         print(f"  Starting from sample: {start_sample_idx}")
         print(f"{'='*70}")
-    
-    # Calculate batches for this host
-    per_host_batch = cfg.batch_size // host_info['num_hosts']
-    num_batches = (len(sequences) + cfg.batch_size - 1) // cfg.batch_size
-    
+
     # CRITICAL: Sync before extraction starts
     if host_info['is_primary'] and cfg.verbose:
-        print(f"\n⏳ Synchronizing hosts before extraction...")
-    
+        print(f"\n  Synchronizing hosts before extraction...")
+
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
         if not barrier("extraction_start", timeout=300):
             raise RuntimeError("Failed to synchronize at 'extraction_start' barrier")
     else:
         sync_hosts("extraction_start")
-    
+
     if host_info['is_primary'] and cfg.verbose:
-        print(f"✓ All hosts synchronized, starting extraction!")
-    
+        print(f"  All hosts synchronized, starting extraction!")
+
     last_saved_shard_count = 0
-    
+    global_sample_offset = 0  # Tracks position in the sorted sequence list
+
     with mesh:
         pbar = tqdm(
-            range(num_batches), 
-            desc=f"Host {host_info['host_id']}", 
+            dynamic_batches,
+            desc=f"Host {host_info['host_id']}",
             disable=not (host_info['is_primary'] and cfg.verbose)
         )
-        
-        for batch_idx in pbar:
-            global_start = batch_idx * cfg.batch_size
-            global_end = min(global_start + cfg.batch_size, len(sequences))
-            
-            # Skip if all samples in this batch have been processed
+
+        for batch in pbar:
+            global_start = global_sample_offset
+            global_end = global_start + len(batch.sequences)
+            global_sample_offset = global_end
+
+            # Skip if all samples in this batch have been processed (resume)
             if global_end <= start_sample_idx:
                 continue
-            
-            # FSDP: All workers process the FULL batch, but sharded
-            # We no longer slice the batch manually per worker
-            host_start = global_start
-            host_end = global_end
-            
-            # Everyone gets same batch - JAX handles sharding
-            batch_sequences = sequences[global_start:global_end]
+
             batch_sample_indices = list(range(global_start, global_end))
-            
+
             process_batch_multihost(
-                jax_model, params, batch_sequences, batch_sample_indices,
+                jax_model, params, batch.sequences, batch_sample_indices,
                 prompts_data, storage, cfg.layers_to_extract,
                 tokenizer.pad_token_id or 0,
-                cfg.batch_size,  # Use global batch size
-                cfg.max_seq_length,
+                batch.batch_size,
+                batch.bucket_size,  # Pad to bucket size, not a fixed max
                 host_info,
                 mesh=mesh,
-                sharding_specs=sharding_specs
+                sharding_specs=sharding_specs,
+                actual_lengths=batch.actual_lengths,
             )
-            
+
             # Checkpoint after shard creation (each host saves independently)
             if cfg.enable_checkpointing and storage.shard_count > last_saved_shard_count:
                 ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
@@ -975,7 +1008,10 @@ def run_extraction(cfg):
                 last_saved_shard_count = storage.shard_count
 
                 if host_info['is_primary'] and cfg.verbose:
-                    pbar.set_postfix({'shards': storage.shard_count})
+                    pbar.set_postfix({
+                        'shards': storage.shard_count,
+                        'bucket': batch.bucket_size,
+                    })
     
     # =========================================================================
     # Step 9: Finalize

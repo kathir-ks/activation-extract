@@ -40,9 +40,22 @@ With right-truncation, the **test input** (near the end) is the first thing lost
 
 The Qwen 2.5 0.5B model supports `max_position_embeddings=32768`. The current limit of 2048 uses only **6.25%** of the model's context window.
 
-### Dataset Characteristics
+### Dataset Characteristics (Measured)
 
-The `200k_HEAVY` dataset contains tasks with large grids. Many prompts from this dataset are likely to exceed 2048 tokens, though the exact distribution needs measurement.
+Measured on 1000 sampled tasks from the `200k_HEAVY` dataset with v1 prompting:
+
+```
+Min:       502    Under 2048:   5.4%
+P10:      2945    Under 4096:  17.6%
+P25:      5232    Under 8192:  46.0%
+Median:   8947    Under 16384: 80.8%
+Mean:    11260    Under 32768: 96.8%
+P95:     29007
+Max:     80847    Exceed 2048:  94.6%
+```
+
+**94.6% of prompts exceed 2048 tokens.** The v1 extraction run (530 GB) had nearly all
+activations from truncated prompts with missing test inputs.
 
 ## Proposed Solutions
 

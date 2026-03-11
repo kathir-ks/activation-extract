@@ -70,6 +70,9 @@ from core import (
     create_dynamic_batches,
     DynamicBatch,
     create_grid_chunks_from_dataset,
+    save_chunks_cache,
+    load_chunks_cache,
+    get_chunk_cache_path,
 )
 
 # Import model utilities
@@ -448,15 +451,43 @@ def main():
     if cfg.pipeline == 'grid_chunking':
         # Grid chunking pipeline: strip text, continuous grid token stream, fixed chunks
         print(f"\nUsing grid chunking pipeline (chunk_size={cfg.max_seq_length})")
-        chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
-            tasks=tasks,
-            grid_encoder=grid_encoder,
-            tokenizer=tokenizer,
+
+        # Try loading from cache first (saves ~2 hours on restart/recovery)
+        cache_path = get_chunk_cache_path(
+            gcs_bucket=cfg.gcs_bucket,
+            gcs_prefix='checkpoints',
+            task_ids=list(tasks.keys()),
             chunk_size=cfg.max_seq_length,
             predictions_per_task=cfg.predictions_per_task,
             random_seed=cfg.random_seed,
-            verbose=cfg.verbose,
         )
+        print(f"  Chunk cache path: {cache_path}")
+
+        cached = load_chunks_cache(cache_path, verbose=cfg.verbose)
+
+        if cached is not None:
+            chunks, chunk_metadata, stream_metadata = cached
+            print(f"  Using cached chunks ({len(chunks)} chunks, skipped data pipeline)")
+        else:
+            print(f"  No cache found, building chunks from scratch...")
+            chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
+                tasks=tasks,
+                grid_encoder=grid_encoder,
+                tokenizer=tokenizer,
+                chunk_size=cfg.max_seq_length,
+                predictions_per_task=cfg.predictions_per_task,
+                random_seed=cfg.random_seed,
+                verbose=cfg.verbose,
+            )
+            # Save cache for future restarts
+            try:
+                save_chunks_cache(
+                    chunks, chunk_metadata, stream_metadata,
+                    cache_path, verbose=cfg.verbose,
+                )
+            except Exception as e:
+                print(f"  Warning: Failed to save chunk cache: {e}")
+
         # All chunks are already padded to max_seq_length — use fixed batching
         sequences = chunks
         prompts_data = [

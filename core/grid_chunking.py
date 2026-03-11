@@ -16,8 +16,14 @@ This is specifically designed for SAE training where continuous grid
 representations matter more than prompt structure.
 """
 
+import hashlib
+import gzip
+import json
+import os
+import pickle
+import time
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from itertools import product
 from tqdm.auto import tqdm
 
@@ -287,3 +293,136 @@ def create_grid_chunks_from_dataset(
         print(f"{'='*60}\n")
 
     return chunks, chunk_metadata, stream_metadata
+
+
+def _compute_cache_key(
+    task_ids: List[str],
+    chunk_size: int,
+    predictions_per_task: int,
+    random_seed: Optional[int],
+) -> str:
+    """Compute a deterministic cache key from pipeline parameters.
+
+    The key hashes sorted task IDs + pipeline params so that any change
+    to the dataset or chunking config invalidates the cache.
+    """
+    key_data = {
+        "task_ids": sorted(task_ids),
+        "chunk_size": chunk_size,
+        "predictions_per_task": predictions_per_task,
+        "random_seed": random_seed,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def save_chunks_cache(
+    chunks: List[List[int]],
+    chunk_metadata: List[ChunkMetadata],
+    stream_metadata: List[Dict],
+    cache_path: str,
+    verbose: bool = False,
+) -> None:
+    """Save computed chunks to a gzipped pickle file (local or GCS).
+
+    Args:
+        chunks: List of token ID lists
+        chunk_metadata: Per-chunk metadata
+        stream_metadata: Per-task stream metadata
+        cache_path: Local path or gs:// URI
+        verbose: Print progress
+    """
+    cache_data = {
+        "chunks": chunks,
+        "chunk_metadata": [asdict(m) for m in chunk_metadata],
+        "stream_metadata": stream_metadata,
+    }
+
+    serialized = pickle.dumps(cache_data, protocol=pickle.HIGHEST_PROTOCOL)
+    compressed = gzip.compress(serialized)
+    size_mb = len(compressed) / (1024 * 1024)
+
+    if cache_path.startswith("gs://"):
+        import fsspec
+        fs = fsspec.filesystem('gs')
+        with fs.open(cache_path, 'wb') as f:
+            f.write(compressed)
+    else:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            f.write(compressed)
+
+    if verbose:
+        print(f"  Saved chunk cache ({size_mb:.1f} MB) to {cache_path}")
+
+
+def load_chunks_cache(
+    cache_path: str,
+    verbose: bool = False,
+) -> Optional[Tuple[List[List[int]], List[ChunkMetadata], List[Dict]]]:
+    """Load chunks from a cached gzipped pickle file.
+
+    Args:
+        cache_path: Local path or gs:// URI
+        verbose: Print progress
+
+    Returns:
+        Tuple of (chunks, chunk_metadata, stream_metadata) or None if cache miss.
+    """
+    try:
+        if cache_path.startswith("gs://"):
+            import fsspec
+            fs = fsspec.filesystem('gs')
+            if not fs.exists(cache_path):
+                return None
+            with fs.open(cache_path, 'rb') as f:
+                compressed = f.read()
+        else:
+            if not os.path.exists(cache_path):
+                return None
+            with open(cache_path, 'rb') as f:
+                compressed = f.read()
+
+        t0 = time.time()
+        serialized = gzip.decompress(compressed)
+        cache_data = pickle.loads(serialized)
+        elapsed = time.time() - t0
+
+        chunks = cache_data["chunks"]
+        chunk_metadata = [
+            ChunkMetadata(**m) for m in cache_data["chunk_metadata"]
+        ]
+        stream_metadata = cache_data["stream_metadata"]
+
+        if verbose:
+            size_mb = len(compressed) / (1024 * 1024)
+            print(f"  Loaded chunk cache ({size_mb:.1f} MB, {len(chunks)} chunks) "
+                  f"from {cache_path} in {elapsed:.1f}s")
+
+        return chunks, chunk_metadata, stream_metadata
+
+    except Exception as e:
+        if verbose:
+            print(f"  Warning: Failed to load chunk cache from {cache_path}: {e}")
+        return None
+
+
+def get_chunk_cache_path(
+    gcs_bucket: Optional[str],
+    gcs_prefix: str,
+    task_ids: List[str],
+    chunk_size: int,
+    predictions_per_task: int,
+    random_seed: Optional[int],
+) -> str:
+    """Build the cache file path based on pipeline parameters.
+
+    Returns a gs:// URI if gcs_bucket is provided, otherwise a local path.
+    """
+    cache_key = _compute_cache_key(task_ids, chunk_size, predictions_per_task, random_seed)
+    filename = f"grid_chunks_{cache_key}.pkl.gz"
+
+    if gcs_bucket:
+        return f"gs://{gcs_bucket}/{gcs_prefix}/{filename}"
+    else:
+        return os.path.join("./cache", filename)

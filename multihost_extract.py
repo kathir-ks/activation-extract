@@ -57,6 +57,9 @@ from core import (
     pad_batch_to_bucket,
     DynamicBatch,
     create_grid_chunks_from_dataset,
+    save_chunks_cache,
+    load_chunks_cache,
+    get_chunk_cache_path,
 )
 
 # Import new multihost utilities
@@ -876,15 +879,51 @@ def run_extraction(cfg):
         if host_info['is_primary'] and cfg.verbose:
             print(f"\nUsing grid chunking pipeline (chunk_size={cfg.max_seq_length})")
 
-        chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
-            tasks=tasks,
-            grid_encoder=grid_encoder,
-            tokenizer=tokenizer,
+        # Try loading from cache first (saves ~2 hours on restart/recovery)
+        ckpt_gcs_bucket = cfg.checkpoint_gcs_bucket or cfg.gcs_bucket
+        cache_path = get_chunk_cache_path(
+            gcs_bucket=ckpt_gcs_bucket,
+            gcs_prefix=cfg.checkpoint_gcs_prefix,
+            task_ids=list(tasks.keys()),
             chunk_size=cfg.max_seq_length,
             predictions_per_task=cfg.predictions_per_task,
             random_seed=cfg.random_seed,
+        )
+
+        if host_info['is_primary'] and cfg.verbose:
+            print(f"  Chunk cache path: {cache_path}")
+
+        cached = load_chunks_cache(
+            cache_path,
             verbose=host_info['is_primary'] and cfg.verbose,
         )
+
+        if cached is not None:
+            chunks, chunk_metadata, stream_metadata = cached
+            if host_info['is_primary'] and cfg.verbose:
+                print(f"  Using cached chunks ({len(chunks)} chunks, skipped data pipeline)")
+        else:
+            if host_info['is_primary'] and cfg.verbose:
+                print(f"  No cache found, building chunks from scratch...")
+            chunks, chunk_metadata, stream_metadata = create_grid_chunks_from_dataset(
+                tasks=tasks,
+                grid_encoder=grid_encoder,
+                tokenizer=tokenizer,
+                chunk_size=cfg.max_seq_length,
+                predictions_per_task=cfg.predictions_per_task,
+                random_seed=cfg.random_seed,
+                verbose=host_info['is_primary'] and cfg.verbose,
+            )
+            # Primary host saves cache for future restarts
+            if host_info['is_primary'] and ckpt_gcs_bucket:
+                try:
+                    save_chunks_cache(
+                        chunks, chunk_metadata, stream_metadata,
+                        cache_path, verbose=cfg.verbose,
+                    )
+                except Exception as e:
+                    print(f"  Warning: Failed to save chunk cache: {e}")
+
         sequences = chunks
         prompts_data = [
             {'task_id': f'chunk_{m.chunk_idx}', 'prompt': f'grid_chunk_{m.chunk_idx}'}

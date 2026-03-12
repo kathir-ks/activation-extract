@@ -1,379 +1,177 @@
-# Qwen Activation Extraction for Sparse Autoencoders
+# Activation Extraction for SAE Training
 
-Complete pipeline for extracting layer activations from Qwen 2.5 models on TPUs for Sparse Autoencoder (SAE) training and mechanistic interpretability research on ARC-AGI tasks.
+Extract layer activations from Qwen 2.5 models on TPU pods for Sparse Autoencoder (SAE) training. Designed for ARC-AGI grid data on preemptible TPU pods with automatic recovery.
 
-## 🎯 What This Does
+## Current Setup
 
-This system enables:
-1. **Extract** layer activations from Qwen 2.5 models (0.5B, 7B)
-2. **Run** on massively parallel pre-emptible TPUs (32-64 workers)
-3. **Store** activations efficiently with automatic GCS upload
-4. **Resume** automatically from checkpoints (fault-tolerant)
-5. **Process** ARC-AGI tasks and FineWeb datasets
+| Component | Value |
+|-----------|-------|
+| Model | Qwen 2.5 0.5B (24 layers, hidden_size=896) |
+| TPU | v5litepod-64 (16 workers x 4 chips = 64 devices) |
+| Pipeline | Grid chunking (grids-only, no prompt text) |
+| Chunk size | 5120 tokens |
+| Batch size | 16 (global across all hosts) |
+| Dataset | 50K ARC tasks (JSONL on GCS) |
+| Output | Gzipped pickle shards uploaded to GCS |
 
-## ⚡ Quick Start (Parallel Workers - Recommended)
+## Quick Start
 
-**For massively parallel extraction on pre-emptible TPUs:**
+See **[RUNBOOK.md](RUNBOOK.md)** for step-by-step instructions to launch an extraction run.
 
-```bash
-# Step 1: Create dataset streams (once)
-python create_dataset_streams.py \
-    --num_streams 32 \
-    --output_dir ./data/streams \
-    --max_samples 200000
+## How It Works
 
-# Step 2: On each TPU (worker 0 to 31)
-export TPU_WORKER_ID=0  # Change for each TPU
-export GCS_BUCKET=my-bucket
-export UPLOAD_TO_GCS=true
-./launch_worker.sh
-```
+### Grid Chunking Pipeline
 
-See **[README_PARALLEL_WORKERS.md](README_PARALLEL_WORKERS.md)** for complete guide.
+Instead of full prompts (system prompt + instructions + grids), the grid chunking pipeline:
 
-## 📚 Documentation
+1. Strips all text/instructions
+2. Encodes only grid data (train inputs, train outputs, test inputs) using `GridShapeEncoder`
+3. Applies data augmentation (rotations, flips, color maps) for diversity
+4. Concatenates all grid tokens into a single continuous stream
+5. Splits the stream into fixed 5120-token chunks
 
-### Getting Started
-- **[README_PARALLEL_WORKERS.md](README_PARALLEL_WORKERS.md)** - ⭐ **Start here!** Parallel workers quick start
-- **[PARALLEL_WORKERS_GUIDE.md](PARALLEL_WORKERS_GUIDE.md)** - Comprehensive parallel workers guide
-- **[QUICK_START.md](QUICK_START.md)** - Traditional single-host quick start
+This maximizes token utilization for SAE training -- every token is actual grid content.
 
-### Technical Documentation
-- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Implementation details & technical overview
-- **[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)** - What was delivered & testing results
-- **[GCS_UPLOAD_GUIDE.md](GCS_UPLOAD_GUIDE.md)** - Google Cloud Storage setup
-- **[SHARD_FORMAT_SPEC.md](SHARD_FORMAT_SPEC.md)** - Activation data format
-- **[DATA_STORAGE_ARCHITECTURE.md](DATA_STORAGE_ARCHITECTURE.md)** - Storage architecture
+### Multihost TPU Architecture
 
-## 📁 Project Structure
+The v5litepod-64 has 16 SSH-accessible workers, each with 4 TPU chips. JAX SPMD coordinates all 64 devices as a single mesh:
 
 ```
-qwen/
-├── 🚀 Parallel Workers (Recommended)
-│   ├── extract_activations.py              # Main extraction script (checkpoint/resume)
-│   ├── create_dataset_streams.py           # Split dataset into N streams
-│   ├── launch_worker.sh                    # Launch single worker
-│   ├── example_parallel_workflow.sh        # Complete workflow example
-│   └── test_checkpoint_system.py           # Unit tests
-│
-├── 🔧 Core Utilities
-│   ├── qwen2_jax.py                        # JAX Qwen model implementation
-│   ├── qwen2_jax_with_hooks.py             # Model with activation extraction hooks
-│   ├── kvcache_utils.py                    # KV cache for efficient generation
-│   ├── convert_hf_to_arc_format.py         # HuggingFace → ARC format conversion
-│   │
-│   ├── core/                               # Shared core utilities
-│   │   ├── jax_utils.py                    # JAX/TPU utilities
-│   │   ├── dataset_utils.py                # Dataset loading & prompting
-│   │   └── activation_storage.py           # GCS upload & storage
-│   │
-│   └── arc24/                              # ARC-AGI utilities
-│       ├── encoders.py                     # Grid encoders (minimal, shape, etc.)
-│       ├── prompting.py                    # Prompt generation with templates
-│       ├── data_augmentation.py            # Geometric transformations
-│       └── utils.py                        # Utility functions
-│
-├── 📦 Refactored Modular Framework
-│   └── refactored/
-│       ├── model/                          # Model implementation
-│       │   ├── qwen.py                     # Core JAX model
-│       │   ├── hooks.py                    # Activation hooks
-│       │   └── kv_cache.py                 # KV cache utils
-│       ├── arc/                            # ARC integration
-│       ├── data/                           # Dataset utilities
-│       └── extraction/                     # Extraction pipeline
-│
-├── 🗂️ Deployment & Scripts
-│   ├── deploy/                             # Deployment scripts
-│   └── scripts/                            # Helper scripts
-│
-├── 📚 Documentation
-│   ├── README_PARALLEL_WORKERS.md          # Parallel workers quick start
-│   ├── PARALLEL_WORKERS_GUIDE.md           # Comprehensive guide
-│   ├── IMPLEMENTATION_SUMMARY.md           # Technical details
-│   ├── IMPLEMENTATION_COMPLETE.md          # Delivery summary
-│   ├── GCS_UPLOAD_GUIDE.md                 # GCS setup
-│   └── [other docs...]
-│
-└── 🗄️ Archived (Old Implementations)
-    └── archived_old/
-        ├── extraction_scripts/             # Old extraction implementations
-        ├── test_files/                     # Old test files
-        ├── verification_scripts/           # Old verification scripts
-        └── old_docs/                       # Outdated documentation
+Control Machine (you)
+  |
+  |  nohup scripts/launch_extraction.sh
+  |
+  v
+TPU Pod (v5litepod-64) -- 16 workers, 64 chips
+  |
+  |-- Worker 0  (barrier sync server)
+  |-- Worker 1  (JAX primary, process_index=0)
+  |-- Worker 2
+  |-- ...
+  |-- Worker 15
+  |
+  |-- All workers run multihost_extract.py independently
+  |-- JAX SPMD shards batches across all 64 devices
+  |-- Socket barrier sync coordinates startup
+  |
+  v
+GCS: gs://bucket/activations/host_*/shard_*.pkl.gz
+GCS: gs://bucket/checkpoints/*.json (survive preemption)
+GCS: gs://bucket/checkpoints/grid_chunks_*.pkl.gz (chunk cache)
 ```
 
-## 🏗️ Architecture
+### Preemption Recovery
 
-### Parallel Workers Architecture (Current)
+The resilient launcher (`scripts/launch_extraction.sh`) runs on the control machine under `nohup` and handles the full lifecycle:
 
-```
-┌─────────────────────────────────────┐
-│  barc0/200k_HEAVY dataset           │
-│  Split into N streams               │
-└──────────┬──────────────────────────┘
-           │
-   ┌───────┼───────┬────────┐
-   │       │       │        │
-Stream0 Stream1 Stream2 ... StreamN
-   │       │       │        │
-   ▼       ▼       ▼        ▼
-┌─────┐┌─────┐┌─────┐  ┌─────┐
-│TPU 0││TPU 1││TPU 2│..│TPU N│
-└──┬──┘└──┬──┘└──┬──┘  └──┬──┘
-   │      │      │        │
-   │ Checkpoint + GCS     │
-   ▼      ▼      ▼        ▼
-gs://bucket/activations/
-├── tpu_0/shard_*.pkl.gz
-├── tpu_1/shard_*.pkl.gz
-└── ...
-```
+1. Deploys code + deps to all 16 workers
+2. Launches `multihost_extract.py` on all workers
+3. Polls every 5 minutes for TPU health
+4. On preemption: waits for TPU recreation, re-deploys, relaunches
+5. Extraction resumes from GCS checkpoint automatically
+6. **Chunk cache** skips the ~2 hour data pipeline on restart
 
-**Key Features:**
-- ✅ **Independent Workers** - No coordination needed
-- ✅ **Checkpoint/Resume** - Automatic recovery from pre-emption
-- ✅ **Per-Worker GCS Folders** - Organized, conflict-free storage
-- ✅ **Cost-Effective** - Designed for 70% cheaper pre-emptible TPUs
-- ✅ **All Layers** - Extracts all 24 layers by default
+### Chunk Caching
 
-## 🔧 Installation
+Building the grid token stream from 50K tasks takes ~2 hours. On the first run, the computed chunks are saved to GCS as a gzipped pickle. On restart (after preemption), all workers load from cache in seconds instead of recomputing.
 
-```bash
-# Clone repository
-git clone <repo-url>
-cd qwen
+Cache is keyed on: sorted task IDs + chunk_size + predictions_per_task + random_seed. Any config change invalidates the cache automatically.
 
-# Install dependencies
-pip install -r requirements.txt
+## Key Files
 
-# Authenticate with GCS (if using GCS upload)
-gcloud auth application-default login
-```
+| File | Purpose |
+|------|---------|
+| `multihost_extract.py` | Main extraction script for TPU pods |
+| `extract_activations.py` | Single-host extraction (testing/small runs) |
+| `scripts/launch_extraction.sh` | Resilient launcher with preemption recovery |
+| `core/grid_chunking.py` | Grid chunking pipeline + chunk caching |
+| `core/jax_utils.py` | JAX/TPU mesh, sharding, multihost init |
+| `core/barrier_sync.py` | Socket-based barrier for worker synchronization |
+| `core/activation_storage.py` | Activation buffering, sharding, GCS upload |
+| `core/dataset_utils.py` | Dataset loading and prompt creation |
+| `qwen2_jax.py` | Qwen 2.5 JAX/Flax implementation |
+| `qwen2_jax_with_hooks.py` | Model with activation extraction hooks |
 
-### Requirements
-- Python 3.10+
-- JAX with TPU support
-- Transformers (HuggingFace)
-- Google Cloud SDK (for GCS upload)
+## Extraction Parameters
 
-See `requirements.txt` for complete list.
+### `multihost_extract.py` key arguments
 
-## 📝 Usage Examples
-
-### 1. Parallel Workers (Recommended)
-
-**Best for:** 32-64 pre-emptible TPUs processing 200k samples
-
-```bash
-# Create streams once
-python create_dataset_streams.py --num_streams 32 --max_samples 200000
-
-# Launch each worker
-export TPU_WORKER_ID=0
-export GCS_BUCKET=my-bucket
-export UPLOAD_TO_GCS=true
-./launch_worker.sh
-```
-
-**Features:**
-- Automatic checkpoint/resume
-- Per-worker GCS folders
-- Fault-tolerant for pre-emptible TPUs
-- 70% cost savings vs on-demand
-
-**Documentation:** [README_PARALLEL_WORKERS.md](README_PARALLEL_WORKERS.md)
-
-### 2. Single-Host Extraction (Traditional)
-
-**Best for:** Testing or small datasets on a single TPU
-
-```bash
-python extract_activations.py \
-    --dataset_path data/tasks.jsonl \
-    --model_path Qwen/Qwen2.5-0.5B \
-    --output_dir ./activations \
-    --batch_size 4 \
-    --upload_to_gcs \
-    --gcs_bucket my-bucket
-```
-
-**Documentation:** [QUICK_START.md](QUICK_START.md)
-
-### 3. Dataset Conversion
-
-**Convert HuggingFace dataset to ARC format:**
-
-```bash
-python convert_hf_to_arc_format.py \
-    --dataset_name barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems \
-    --output_file arc_tasks.jsonl \
-    --max_tasks 1000 \
-    --verbose
-```
-
-## 🧪 Testing
-
-```bash
-# Test checkpoint system
-python test_checkpoint_system.py
-
-# Expected output:
-# ✅ ALL TESTS PASSED
-```
-
-## 📊 Performance
-
-- **Throughput:** ~3-5 samples/second per TPU
-- **Checkpoint Overhead:** <1% of total time
-- **Resume Time:** <30 seconds from checkpoint
-- **GCS Upload:** Non-blocking background upload
-
-## 💰 Cost Estimate
-
-### Example: 200k Samples on 32 Pre-emptible v4-8 TPUs
-
-- **Pre-emptible:** 32 × $1.35/hour × 3 hours = **$130**
-- **On-demand:** 32 × $4.50/hour × 3 hours = **$432**
-- **Savings:** **$302 (70% reduction)**
-
-## 🔑 Key Features
-
-### Fault Tolerance
-- ✅ Checkpoint after every ~1GB shard (~10 minutes)
-- ✅ Automatic resume on restart
-- ✅ Maximum data loss: 1 shard
-- ✅ No manual intervention needed
-
-### Scalability
-- ✅ Independent workers (no coordination)
-- ✅ Horizontal scaling (add more workers = faster)
-- ✅ No bottlenecks or shared state
-- ✅ Failure isolation (one worker failure doesn't affect others)
-
-### Organization
-- ✅ Per-worker GCS folders: `gs://bucket/activations/tpu_N/`
-- ✅ No conflicts between workers
-- ✅ Easy monitoring (check each folder independently)
-- ✅ Checkpoint files: `./checkpoints/checkpoint_worker_N.json`
-
-## 🛠️ Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
+| Argument | Default | Description |
 |----------|---------|-------------|
-| `TPU_WORKER_ID` | 0 | Worker ID (0 to N-1) |
-| `GCS_BUCKET` | - | GCS bucket for uploads |
-| `UPLOAD_TO_GCS` | false | Enable GCS upload |
-| `MODEL_PATH` | Qwen/Qwen2.5-0.5B | Model to use |
-| `BATCH_SIZE` | 4 | Batch size per device |
-| `SHARD_SIZE_GB` | 1.0 | Shard size in GB |
+| `--topology` | `v5e-64` | TPU pod topology |
+| `--model_path` | `Qwen/Qwen2.5-0.5B` | HuggingFace model ID |
+| `--dataset_path` | | Path to JSONL dataset (local or gs://) |
+| `--max_tasks` | all | Limit number of tasks to process |
+| `--pipeline` | `prompt` | `prompt` or `grid_chunking` |
+| `--layers_to_extract` | all | Space-separated layer indices |
+| `--activation_type` | `residual` | `residual`, `mlp`, or `attn` |
+| `--batch_size` | 32 | Global batch size across all hosts |
+| `--max_seq_length` | 5120 | Fixed chunk/sequence length |
+| `--gcs_bucket` | | GCS bucket for activation uploads |
+| `--gcs_prefix` | `activations/multihost` | GCS path prefix |
+| `--checkpoint_gcs_prefix` | `checkpoints` | GCS prefix for checkpoints + chunk cache |
+| `--barrier_controller_host` | auto | Worker 0 IP for barrier sync |
 
-See [PARALLEL_WORKERS_GUIDE.md](PARALLEL_WORKERS_GUIDE.md) for complete configuration options.
+### Activation Types
 
-## 📈 Monitoring
+- `residual` (default): Final layer output after both attention and MLP residual connections
+- `mlp`: MLP output before residual connection
+- `attn`: Attention output before residual connection
 
-```bash
-# Check specific worker
-cat checkpoints/checkpoint_worker_5.json
+## Output Format
 
-# Check GCS uploads
-gsutil ls gs://my-bucket/activations/tpu_5/
+Activations are saved as gzipped pickle shards (~1 GB each):
 
-# Monitor all workers
-for i in {0..31}; do
-    echo -n "Worker $i: "
-    jq -r '.total_samples_processed' checkpoints/checkpoint_worker_$i.json
-done
+```
+gs://bucket/activations/layer19_gridchunk_50k_v5litepod-64/
+  host_00/shard_0001.pkl.gz
+  host_00/shard_0002.pkl.gz
+  ...
+  host_15/shard_0001.pkl.gz
+  ...
 ```
 
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Worker not starting?**
-```bash
-# Check stream file exists
-ls data/streams/stream_$(printf '%03d' $TPU_WORKER_ID).jsonl
-
-# Check GCS authentication
-gsutil ls gs://$GCS_BUCKET/
-```
-
-**Worker not resuming?**
-```bash
-# Check checkpoint
-cat checkpoints/checkpoint_worker_$TPU_WORKER_ID.json
-
-# Verify TPU_WORKER_ID is set
-echo $TPU_WORKER_ID
-```
-
-**GCS upload failing?**
-```bash
-# Re-authenticate
-gcloud auth application-default login
-
-# Test write access
-echo "test" | gsutil cp - gs://$GCS_BUCKET/test.txt
-```
-
-See [PARALLEL_WORKERS_GUIDE.md](PARALLEL_WORKERS_GUIDE.md) for comprehensive troubleshooting.
-
-## 📦 Output Format
-
-Each shard contains activations for all layers:
+Each shard:
 
 ```python
-import pickle
-import gzip
+import pickle, gzip
 
-# Load a shard
 with gzip.open('shard_0001.pkl.gz', 'rb') as f:
     data = pickle.load(f)
 
-# Structure:
 # data = {
-#     0: [  # Layer 0
-#         {'sample_idx': 0, 'activation': np.array(...), 'shape': (seq_len, hidden_size), ...},
+#     19: [  # Layer index
+#         {
+#             'sample_idx': 0,
+#             'activation': np.ndarray,  # shape: (5120, 896)
+#             'shape': (5120, 896),
+#             'text_preview': 'grid_chunk_0'
+#         },
 #         ...
-#     ],
-#     1: [...],  # Layer 1
-#     ...
-#     23: [...]  # Layer 23
+#     ]
 # }
 ```
 
-See [SHARD_FORMAT_SPEC.md](SHARD_FORMAT_SPEC.md) for details.
+## Monitoring
 
-## 🤝 Contributing
+```bash
+# Watch launcher log
+tail -f launch.log
 
-See [refactored/CONTRIBUTING.md](refactored/CONTRIBUTING.md) for development guidelines.
+# Check worker logs (SSH into any worker)
+gcloud compute tpus tpu-vm ssh TPU_NAME --zone=ZONE --worker=0 \
+    --command="tail -50 ~/activation-extract/extraction.log"
 
-## 📄 License
+# Check GCS output
+gsutil ls gs://bucket/activations/layer19_gridchunk_50k_v5litepod-64/host_00/
 
-[Add license information]
+# Count shards across all hosts
+gsutil ls gs://bucket/activations/layer19_gridchunk_50k_v5litepod-64/host_*/*.pkl.gz | wc -l
 
-## 🗂️ Archived Code
+# Check checkpoint status
+gsutil cat gs://bucket/checkpoints/gridchunk_layer19/checkpoint_v5litepod-64_host_00.json | python3 -m json.tool
+```
 
-Old implementations have been moved to `archived_old/` for reference. These include:
-- Old multi-host coordination code
-- Old extraction scripts
-- Old test files
-- Outdated documentation
+## Archived
 
-See [archived_old/README.md](archived_old/README.md) for details.
-
-## 📞 Support
-
-For issues or questions:
-1. Check [PARALLEL_WORKERS_GUIDE.md](PARALLEL_WORKERS_GUIDE.md) troubleshooting section
-2. Review [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for technical details
-3. Run `test_checkpoint_system.py` to verify your setup
-
----
-
-**Status:** ✅ Production-ready with comprehensive documentation and testing
-
-**Last Updated:** January 14, 2026
+Old implementations (independent parallel workers, old deployment scripts, old docs) are in `archived_old/`. The current approach uses multihost JAX SPMD on a single TPU pod instead.

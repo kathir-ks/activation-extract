@@ -44,6 +44,9 @@ from .grid_chunking import (
     chunk_token_stream,
     create_grid_chunks_from_dataset,
     ChunkMetadata,
+    save_chunks_cache,
+    load_chunks_cache,
+    get_chunk_cache_path,
 )
 
 from .mesh_configs import (
@@ -108,4 +111,7 @@ __all__ = [
     'chunk_token_stream',
     'create_grid_chunks_from_dataset',
     'ChunkMetadata',
+    'save_chunks_cache',
+    'load_chunks_cache',
+    'get_chunk_cache_path',
 ]

@@ -19,7 +19,10 @@ from ..data.pipeline import ActivationPipeline
 from ..evaluation.metrics import compute_metrics, compute_dead_neurons
 from ..models.base import BaseSAE
 from ..models.registry import create_sae
-from .checkpointing import save_checkpoint, load_checkpoint, restore_params, restore_opt_state
+from .checkpointing import (
+    save_checkpoint, load_checkpoint, restore_params, restore_opt_state,
+    upload_checkpoint_to_gcs, download_checkpoint_from_gcs,
+)
 from .distributed import create_sae_mesh, shard_batch, replicate_params, get_host_info
 from .lr_schedule import create_optimizer
 from .train_state import SAETrainState
@@ -118,8 +121,14 @@ class SAETrainer:
             total_tokens=0,
         )
 
-        # 7. Try to resume from checkpoint
+        # 7. Try to resume from checkpoint (GCS first, then local)
         start_step = 0
+        if resume and self.train_config.upload_checkpoints_to_gcs and is_primary:
+            download_checkpoint_from_gcs(
+                self.train_config.checkpoint_dir,
+                self.train_config.gcs_bucket,
+                self.train_config.gcs_prefix,
+            )
         if resume:
             ckpt = load_checkpoint(self.train_config.checkpoint_dir)
             if ckpt is not None:
@@ -230,9 +239,9 @@ class SAETrainer:
                 t0 = time.time()
                 tokens_this_log = 0
 
-            # Evaluation
-            if is_primary and step % cfg.eval_every == 0:
-                self._evaluate(step, batch)
+            # Evaluation (all hosts must participate for sharded batch)
+            if step % cfg.eval_every == 0:
+                self._evaluate(step, batch, log=is_primary)
 
             # Checkpointing
             if step % cfg.checkpoint_every == 0:
@@ -247,6 +256,10 @@ class SAETrainer:
                     training_config=self.train_config,
                     keep_last_n=cfg.keep_last_n_checkpoints,
                 )
+                if cfg.upload_checkpoints_to_gcs:
+                    upload_checkpoint_to_gcs(
+                        cfg.checkpoint_dir, step, cfg.gcs_bucket, cfg.gcs_prefix,
+                    )
 
             # Dead neuron resampling
             if (
@@ -276,6 +289,10 @@ class SAETrainer:
                 training_config=self.train_config,
                 keep_last_n=cfg.keep_last_n_checkpoints,
             )
+            if cfg.upload_checkpoints_to_gcs:
+                upload_checkpoint_to_gcs(
+                    cfg.checkpoint_dir, step, cfg.gcs_bucket, cfg.gcs_prefix,
+                )
             if self.log_file:
                 self.log_file.close()
             print(f"\nTraining complete at step {step}.")
@@ -401,24 +418,29 @@ class SAETrainer:
             dead_neuron_steps=dead_steps_new,
         )
 
-    def _evaluate(self, step: int, batch: jnp.ndarray):
-        """Run evaluation metrics on a batch."""
+    def _evaluate(self, step: int, batch: jnp.ndarray, log: bool = True):
+        """Run evaluation metrics on a batch.
+
+        All hosts must call this (model.apply on sharded batch is collective).
+        Only the primary host logs results.
+        """
         x_hat, z, _ = self.model.apply({"params": self.state.params}, batch)
         metrics = compute_metrics(batch, x_hat, z)
         dead_info = compute_dead_neurons(
             self.state.dead_neuron_steps, self.train_config.dead_neuron_window
         )
 
-        print(f"  [Eval step {step}]")
-        print(f"    MSE: {metrics['mse']:.6f}")
-        print(f"    Explained variance: {metrics['explained_variance']:.4f}")
-        print(f"    L0: {metrics['l0']:.1f}")
-        print(f"    Dead neurons: {dead_info['dead_frac']:.1%}")
+        if log:
+            print(f"  [Eval step {step}]")
+            print(f"    MSE: {metrics['mse']:.6f}")
+            print(f"    Explained variance: {metrics['explained_variance']:.4f}")
+            print(f"    L0: {metrics['l0']:.1f}")
+            print(f"    Dead neurons: {dead_info['dead_frac']:.1%}")
 
-        if self.log_file:
-            log_entry = {"step": step, "type": "eval", **metrics, **dead_info}
-            self.log_file.write(json.dumps(log_entry, default=float) + "\n")
-            self.log_file.flush()
+            if self.log_file:
+                log_entry = {"step": step, "type": "eval", **metrics, **dead_info}
+                self.log_file.write(json.dumps(log_entry, default=float) + "\n")
+                self.log_file.flush()
 
     def _log_step(self, step: int, loss_dict: dict, tokens_per_sec: float):
         """Log training metrics."""

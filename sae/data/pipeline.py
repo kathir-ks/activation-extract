@@ -57,11 +57,12 @@ class ActivationPipeline:
 
         # Loop indefinitely — training loop has its own num_steps limit.
         # This handles epoch boundaries by restarting the source.
+        epoch = 0
         while True:
             buf = ShuffleBuffer(
                 self.source,
                 buffer_size=self.config.shuffle_buffer_size,
-                seed=self.config.seed + self.host_id,
+                seed=self.config.seed + self.host_id + epoch * 1000,
             )
             exhausted = False
             for batch in buf.iter_batches(per_host_batch):
@@ -70,6 +71,7 @@ class ActivationPipeline:
             if not exhausted:
                 # Source had no data at all
                 break
+            epoch += 1
 
     def iter_batches_unbuffered(self) -> Iterator[jnp.ndarray]:
         """Yield batches directly from source (no shuffling). For eval."""

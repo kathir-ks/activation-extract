@@ -77,6 +77,14 @@ def shard_batch(
     # Multi-host: split local batch across local devices
     local_devices = jax.local_devices()
     num_local = len(local_devices)
+
+    if batch.shape[0] % num_local != 0:
+        raise ValueError(
+            f"Per-host batch size {batch.shape[0]} must be divisible by "
+            f"local device count {num_local}. Use a global batch_size "
+            f"divisible by {num_local * num_hosts} (total devices)."
+        )
+
     per_device = batch.shape[0] // num_local
     global_batch_size = batch.shape[0] * num_hosts
 

@@ -98,6 +98,12 @@ def parse_args():
     io.add_argument("--keep_last_n_checkpoints", type=int, default=3)
     io.add_argument("--no_resume", action="store_true",
                      help="Don't resume from checkpoint")
+    io.add_argument("--upload_checkpoints_to_gcs", action="store_true",
+                     help="Upload checkpoints to GCS (survives preemption)")
+    io.add_argument("--checkpoint_gcs_bucket", type=str, default=None,
+                     help="GCS bucket for durable checkpoints")
+    io.add_argument("--checkpoint_gcs_prefix", type=str, default="sae_checkpoints",
+                     help="GCS prefix for checkpoint files")
 
     # Distributed
     dist = parser.add_argument_group("Distributed")
@@ -210,6 +216,9 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
             keep_last_n_checkpoints=args.keep_last_n_checkpoints,
+            upload_checkpoints_to_gcs=args.upload_checkpoints_to_gcs,
+            gcs_bucket=args.checkpoint_gcs_bucket,
+            gcs_prefix=args.checkpoint_gcs_prefix,
             mesh_type=args.mesh_type,
         )
 

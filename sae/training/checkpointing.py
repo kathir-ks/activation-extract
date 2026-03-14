@@ -89,6 +89,102 @@ def save_checkpoint(
     print(f"  Checkpoint saved: {ckpt_dir}")
 
 
+def upload_checkpoint_to_gcs(
+    checkpoint_dir: str,
+    step: int,
+    gcs_bucket: str,
+    gcs_prefix: str,
+):
+    """Upload a local checkpoint to GCS for preemption recovery.
+
+    Args:
+        checkpoint_dir: Local checkpoint base directory.
+        step: Step number of the checkpoint to upload.
+        gcs_bucket: GCS bucket name.
+        gcs_prefix: GCS prefix (path within bucket).
+    """
+    if jax.process_index() != 0:
+        return
+
+    import fsspec
+    import shutil
+
+    ckpt_dir = Path(checkpoint_dir) / f"step_{step:08d}"
+    if not ckpt_dir.exists():
+        return
+
+    fs = fsspec.filesystem("gs")
+    gcs_ckpt_path = f"{gcs_bucket}/{gcs_prefix}/step_{step:08d}"
+
+    # Upload all files recursively
+    for local_file in ckpt_dir.rglob("*"):
+        if local_file.is_file():
+            rel = local_file.relative_to(ckpt_dir)
+            gcs_file = f"{gcs_ckpt_path}/{rel}"
+            fs.put(str(local_file), gcs_file)
+
+    # Write a marker with the latest step
+    marker_path = f"{gcs_bucket}/{gcs_prefix}/latest_step.json"
+    with fs.open(marker_path, "w") as f:
+        json.dump({"step": step}, f)
+
+    print(f"  Checkpoint uploaded to gs://{gcs_ckpt_path}")
+
+
+def download_checkpoint_from_gcs(
+    checkpoint_dir: str,
+    gcs_bucket: str,
+    gcs_prefix: str,
+) -> Optional[int]:
+    """Download the latest GCS checkpoint to local disk.
+
+    Args:
+        checkpoint_dir: Local checkpoint directory to download into.
+        gcs_bucket: GCS bucket name.
+        gcs_prefix: GCS prefix.
+
+    Returns:
+        Step number of downloaded checkpoint, or None if not found.
+    """
+    import fsspec
+
+    fs = fsspec.filesystem("gs")
+    marker_path = f"{gcs_bucket}/{gcs_prefix}/latest_step.json"
+
+    if not fs.exists(marker_path):
+        return None
+
+    with fs.open(marker_path, "r") as f:
+        marker = json.load(f)
+    step = marker["step"]
+
+    gcs_ckpt_path = f"{gcs_bucket}/{gcs_prefix}/step_{step:08d}"
+    local_ckpt = Path(checkpoint_dir) / f"step_{step:08d}"
+
+    if local_ckpt.exists():
+        return step  # Already have it locally
+
+    local_ckpt.mkdir(parents=True, exist_ok=True)
+
+    # Download all files
+    files = fs.ls(gcs_ckpt_path, detail=False)
+    for gcs_file in files:
+        name = gcs_file.split("/")[-1]
+        if fs.isdir(gcs_file):
+            # Subdirectory (params/, opt_state/)
+            subdir = local_ckpt / name
+            subdir.mkdir(exist_ok=True)
+            sub_files = fs.ls(gcs_file, detail=False)
+            for sf in sub_files:
+                sname = sf.split("/")[-1]
+                fs.get(sf, str(subdir / sname))
+        else:
+            fs.get(gcs_file, str(local_ckpt / name))
+
+    print(f"  Checkpoint downloaded from GCS: step {step}")
+    return step
+
+
 def load_checkpoint(
     checkpoint_dir: str,
     step: Optional[int] = None,

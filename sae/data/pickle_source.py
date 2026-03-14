@@ -24,6 +24,8 @@ class PickleShardSource(ActivationSource):
         shuffle_shards: Randomize shard loading order.
         seed: Random seed for shard shuffling.
         gcs_path: If set, load from GCS via fsspec (e.g. "gs://bucket/prefix").
+        host_id: This host's index for per-host shard claiming (multi-host training).
+        num_hosts: Total number of hosts for shard distribution.
     """
 
     def __init__(
@@ -34,17 +36,24 @@ class PickleShardSource(ActivationSource):
         shuffle_shards: bool = True,
         seed: int = 42,
         gcs_path: Optional[str] = None,
+        host_id: int = 0,
+        num_hosts: int = 1,
     ):
         self.layer_index = layer_index
         self.compressed = compressed
         self.shuffle_shards = shuffle_shards
         self.seed = seed
+        self.host_id = host_id
+        self.num_hosts = num_hosts
         self._hidden_dim = None
 
         if gcs_path:
             self._init_gcs(gcs_path)
         else:
             self._init_local(shard_dir)
+
+        # Per-host shard claiming for multi-host training
+        self._claim_host_shards()
 
     def _init_local(self, shard_dir: str):
         self.shard_dir = Path(shard_dir)
@@ -71,21 +80,52 @@ class PickleShardSource(ActivationSource):
         self.fs = fsspec.filesystem("gs")
         prefix = gcs_path.replace("gs://", "")
 
-        # List shard files on GCS
         ext = ".pkl.gz" if self.compressed else ".pkl"
-        all_files = self.fs.ls(prefix)
-        self._shard_files = sorted([f for f in all_files if f.endswith(ext)])
+
+        # Check if this is a parent dir containing host_XX subdirs
+        all_entries = self.fs.ls(prefix)
+        host_dirs = sorted([
+            e for e in all_entries
+            if self.fs.isdir(e) and "host_" in e.split("/")[-1]
+        ])
+
+        if host_dirs:
+            # Multi-host: collect shards from all host directories
+            self._shard_files = []
+            for hdir in host_dirs:
+                files = self.fs.ls(hdir)
+                self._shard_files.extend(
+                    sorted([f for f in files if f.endswith(ext)])
+                )
+            print(f"  GCS multi-host: {len(host_dirs)} hosts, {len(self._shard_files)} shards")
+        else:
+            # Single directory of shards
+            self._shard_files = sorted([f for f in all_entries if f.endswith(ext)])
 
         if not self._shard_files:
             raise FileNotFoundError(f"No {ext} files at {gcs_path}")
 
-        # Try metadata
-        meta_path = f"{prefix}/metadata.json"
-        if self.fs.exists(meta_path):
-            with self.fs.open(meta_path, "r") as f:
-                self._metadata = json.load(f)
-        else:
-            self._metadata = None
+        # Try metadata from first host dir or root
+        meta_candidates = (
+            [f"{host_dirs[0]}/metadata.json"] if host_dirs else []
+        ) + [f"{prefix}/metadata.json"]
+        self._metadata = None
+        for meta_path in meta_candidates:
+            if self.fs.exists(meta_path):
+                with self.fs.open(meta_path, "r") as f:
+                    self._metadata = json.load(f)
+                break
+
+    def _claim_host_shards(self):
+        """Select this host's subset of shards via round-robin."""
+        if self.num_hosts <= 1:
+            return
+        all_shards = list(self._shard_files)
+        # Deterministic sort so all hosts agree on ordering
+        all_shards.sort(key=lambda f: str(f))
+        # Round-robin: host 0 gets shards 0, 8, 16, ...; host 1 gets 1, 9, 17, ...
+        self._shard_files = all_shards[self.host_id::self.num_hosts]
+        print(f"  Host {self.host_id}/{self.num_hosts}: claimed {len(self._shard_files)}/{len(all_shards)} shards")
 
     def _load_shard(self, path) -> dict:
         """Load a single shard file."""
@@ -125,7 +165,8 @@ class PickleShardSource(ActivationSource):
     def _get_ordered_files(self) -> List:
         files = list(self._shard_files)
         if self.shuffle_shards:
-            rng = np.random.RandomState(self.seed)
+            # Different seed per host so each reads in a different order
+            rng = np.random.RandomState(self.seed + self.host_id)
             rng.shuffle(files)
         return files
 

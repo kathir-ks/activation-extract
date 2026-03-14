@@ -146,10 +146,12 @@ class SAETrainer:
         with self.mesh:
             self.state = replicate_params(self.state, self.mesh)
 
-        # 9. Setup data pipeline
+        # 9. Setup data pipeline (per-host data sharding in multi-host)
         self.pipeline = ActivationPipeline(
             config=self.train_config,
             source=self.source,
+            host_id=self.host_info["host_id"],
+            num_hosts=self.host_info["num_hosts"],
         )
 
         # 10. Setup logging
@@ -203,9 +205,9 @@ class SAETrainer:
             if step >= cfg.num_steps:
                 break
 
-            # Shard batch across devices
+            # Shard batch across devices (multi-host aware)
             with self.mesh:
-                batch = shard_batch(batch, self.mesh)
+                batch = shard_batch(batch, self.mesh, num_hosts=self.host_info["num_hosts"])
 
             # Train step (uses architecture-specific loss via compute_loss)
             self.state, loss_dict = self._jit_train_step(self.state, batch)

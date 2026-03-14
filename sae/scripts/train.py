@@ -103,6 +103,12 @@ def parse_args():
     dist = parser.add_argument_group("Distributed")
     dist.add_argument("--mesh_type", type=str, default="auto",
                       choices=["auto", "1d", "data_parallel"])
+    dist.add_argument("--enable_barrier_sync", action="store_true",
+                      help="Enable socket barrier sync for multi-host SSH launch")
+    dist.add_argument("--barrier_port", type=int, default=5555,
+                      help="Port for barrier sync server")
+    dist.add_argument("--barrier_controller_host", type=str, default=None,
+                      help="IP of barrier controller (auto-detect if not set)")
 
     # Backend
     backend = parser.add_argument_group("Backend")
@@ -126,6 +132,31 @@ def main():
         import os
         os.environ["JAX_PLATFORMS"] = args.backend
 
+    # Barrier sync BEFORE JAX init (prevents SSH stagger issues)
+    barrier_client = None
+    barrier_server = None
+    if args.enable_barrier_sync:
+        import os
+        from core.barrier_sync import (
+            BarrierServer, BarrierClient,
+            get_worker0_internal_ip, get_worker_id, get_num_workers,
+        )
+        worker_id = get_worker_id()
+        num_workers = get_num_workers()
+        controller_host = args.barrier_controller_host or get_worker0_internal_ip()
+
+        # Worker 0 starts the barrier server
+        if worker_id == 0:
+            barrier_server = BarrierServer(num_workers=num_workers, port=args.barrier_port)
+            barrier_server.start_background()
+
+        barrier_client = BarrierClient(
+            controller_host=controller_host,
+            worker_id=worker_id,
+            port=args.barrier_port,
+        )
+        barrier_client.wait_at_barrier("pre_jax_init")
+
     from sae.configs.base import SAEConfig
     from sae.configs.training import TrainingConfig
     from sae.training.trainer import SAETrainer
@@ -133,6 +164,9 @@ def main():
 
     # Initialize distributed (auto-detects single vs multi-host)
     host_info = initialize_distributed(verbose=True)
+
+    if barrier_client:
+        barrier_client.wait_at_barrier("post_jax_init")
 
     # Build configs
     if args.preset:
@@ -183,6 +217,12 @@ def main():
     trainer = SAETrainer(sae_config, train_config)
     trainer.setup(resume=not args.no_resume)
     trainer.train()
+
+    # Clean up barrier sync
+    if barrier_client:
+        barrier_client.wait_at_barrier("training_complete")
+    if barrier_server:
+        barrier_server.stop()
 
 
 def _build_source_kwargs(args) -> dict:

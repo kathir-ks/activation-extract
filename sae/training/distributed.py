@@ -53,15 +53,43 @@ def create_sae_mesh(mesh_type: str = "auto", verbose: bool = False) -> Mesh:
     return mesh
 
 
-def shard_batch(batch: jnp.ndarray, mesh: Mesh) -> jnp.ndarray:
+def shard_batch(
+    batch: jnp.ndarray,
+    mesh: Mesh,
+    num_hosts: int = 1,
+) -> jnp.ndarray:
     """Shard a batch of activations across the data axis.
 
+    In single-host mode, uses jax.device_put directly.
+    In multi-host mode, each host provides its LOCAL portion and we use
+    jax.make_array_from_single_device_arrays to create the global array.
+
     Args:
-        batch: [batch_size, hidden_dim]
+        batch: Local batch [per_host_batch_size, hidden_dim].
         mesh: Device mesh with 'data' axis.
+        num_hosts: Number of hosts (1 = single-host).
     """
     sharding = NamedSharding(mesh, P("data", None))
-    return jax.device_put(batch, sharding)
+
+    if num_hosts <= 1:
+        return jax.device_put(batch, sharding)
+
+    # Multi-host: split local batch across local devices
+    local_devices = jax.local_devices()
+    num_local = len(local_devices)
+    per_device = batch.shape[0] // num_local
+    global_batch_size = batch.shape[0] * num_hosts
+
+    local_arrays = []
+    for i, device in enumerate(local_devices):
+        slab = batch[i * per_device : (i + 1) * per_device]
+        local_arrays.append(jax.device_put(jnp.array(slab), device))
+
+    return jax.make_array_from_single_device_arrays(
+        shape=(global_batch_size, batch.shape[1]),
+        sharding=sharding,
+        arrays=local_arrays,
+    )
 
 
 def replicate_params(params, mesh: Mesh):

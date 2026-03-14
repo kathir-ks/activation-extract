@@ -8,9 +8,13 @@ This module provides:
 
 Supported TPU Types:
 - v5e-8:   1 host  × 8 chips  = 8 devices
-- v5e-64:  4 hosts × 8 chips  = 32 devices  
+- v5e-64:  4 hosts × 8 chips  = 32 devices
 - v5e-128: 8 hosts × 8 chips  = 64 devices
 - v5e-256: 16 hosts × 8 chips = 128 devices
+- v6e-8:   1 host  × 8 chips  = 8 devices
+- v6e-64:  8 hosts × 8 chips  = 64 devices
+- v6e-128: 16 hosts × 8 chips = 128 devices
+- v6e-256: 32 hosts × 8 chips = 256 devices
 """
 
 import jax
@@ -92,6 +96,43 @@ TPU_TOPOLOGIES: Dict[str, TopologyConfig] = {
         mesh_shape=(16, 8),
         axis_names=('data', 'model'),
         recommended_batch_size=128,
+        recommended_seq_length=2048,
+    ),
+    # v6e TPU pods
+    'v6e-8': TopologyConfig(
+        name='v6e-8',
+        hosts=1,
+        chips_per_host=8,
+        mesh_shape=(1, 8),
+        axis_names=('data', 'model'),
+        recommended_batch_size=8,
+        recommended_seq_length=2048,
+    ),
+    'v6e-64': TopologyConfig(
+        name='v6e-64',
+        hosts=8,
+        chips_per_host=8,
+        mesh_shape=(8, 8),
+        axis_names=('data', 'model'),
+        recommended_batch_size=64,
+        recommended_seq_length=2048,
+    ),
+    'v6e-128': TopologyConfig(
+        name='v6e-128',
+        hosts=16,
+        chips_per_host=8,
+        mesh_shape=(16, 8),
+        axis_names=('data', 'model'),
+        recommended_batch_size=128,
+        recommended_seq_length=2048,
+    ),
+    'v6e-256': TopologyConfig(
+        name='v6e-256',
+        hosts=32,
+        chips_per_host=8,
+        mesh_shape=(32, 8),
+        axis_names=('data', 'model'),
+        recommended_batch_size=256,
         recommended_seq_length=2048,
     ),
     # v4 TPU pods

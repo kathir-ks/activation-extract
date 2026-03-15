@@ -139,6 +139,45 @@ gsutil ls "gs://YOUR_BUCKET/activations/layer19_gridchunk_50k_v5litepod-64/host_
 gsutil ls gs://YOUR_BUCKET/checkpoints/gridchunk_layer19/grid_chunks_*.pkl.gz
 ```
 
+## Auto-Start After Control Machine Reboot
+
+The launcher can survive control machine reboots via `@reboot` crontab.
+
+### Enable auto-start
+
+```bash
+# Install the crontab entry (one-time)
+(crontab -l 2>/dev/null; echo "@reboot /home/kathirks_gc/activation-extract/scripts/start_launcher.sh") | crontab -
+```
+
+### How it works
+
+`scripts/start_launcher.sh` is a thin wrapper that:
+1. Checks if the launcher is already running (via PID file)
+2. Starts `launch_extraction.sh` under `nohup` if not
+3. Writes PID to `launcher.pid` for tracking
+
+On reboot, cron runs the wrapper automatically. On preemption recovery, the existing launcher handles everything — the wrapper just ensures the launcher itself is alive.
+
+### Manage auto-start
+
+```bash
+# Check if enabled
+crontab -l
+
+# Disable auto-start
+crontab -r
+
+# Start manually (safe to call if already running)
+bash scripts/start_launcher.sh
+
+# Check if launcher is running
+cat launcher.pid && kill -0 $(cat launcher.pid) 2>/dev/null && echo "Running" || echo "Not running"
+
+# Stop the launcher
+kill $(cat launcher.pid)
+```
+
 ## What Happens on Preemption
 
 1. GCP preempts the TPU pod -- all workers die

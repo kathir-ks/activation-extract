@@ -346,27 +346,64 @@ def process_batch_multihost(
 
     # ── FSDP path: each host extracts its own addressable shard ──────
     if mesh is not None and sharding_specs is not None:
+        # Gather activations along model axis so each host gets full hidden_dim.
+        # Without this, each host only has a slice (e.g. 448 of 896 with model=2).
+        from jax.sharding import PartitionSpec as P
+        data_axis = mesh.axis_names[0]
+        act_sharding = NamedSharding(mesh, P(data_axis, None, None))
+
         # Transfer this host's addressable shards to numpy
         host_activations = {}
+        local_shard_indices = None
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
             if layer_key in activations:
-                # Sort shards by index to guarantee batch-dimension ordering
-                local_shards = sorted(
-                    activations[layer_key].addressable_shards,
-                    key=lambda s: s.index,
-                )
+                # Re-shard to P(data, None, None) — triggers all-gather on model axis
+                full_act = jax.device_put(activations[layer_key], act_sharding)
+                # After re-sharding, local devices may hold identical replicas
+                # (e.g. 4 chips on one host all have the same data shard).
+                # Deduplicate by taking only unique shard indices.
+                local_shards = full_act.addressable_shards
+                seen_indices = {}
+                for s in local_shards:
+                    if s.index not in seen_indices:
+                        seen_indices[s.index] = s
+                unique_shards = sorted(seen_indices.values(), key=lambda s: s.index)
                 local_data = np.concatenate(
-                    [np.array(s.data) for s in local_shards], axis=0
+                    [np.array(s.data) for s in unique_shards], axis=0
                 )
                 host_activations[layer_key] = local_data
+                # Capture shard indices from the first layer
+                if local_shard_indices is None:
+                    local_shard_indices = sorted(set(s.index for s in local_shards))
 
-        # Map local shard rows back to global sample indices
-        per_host_samples = actual_batch_size // host_info['num_hosts']
-        local_start = host_info['host_id'] * per_host_samples
-        local_end = min(local_start + per_host_samples, actual_batch_size)
+        # Map local shard rows back to global sample indices.
+        # Use shard index tuples to determine which data-axis positions
+        # this host owns, rather than assuming host_id maps to data position.
+        first_layer_key = f'layer_{layers_to_extract[0]}'
+        n_local_samples = host_activations[first_layer_key].shape[0]
+        # Shard index tuple's first element is the batch slice (data axis position)
+        local_batch_positions = sorted(set(idx[0] for idx in local_shard_indices))
+        # Each data position corresponds to (batch_size / data_axis_size) samples
+        data_axis_size = mesh.shape[data_axis]
+        samples_per_position = actual_batch_size // data_axis_size
+        global_indices = []
+        for pos in local_batch_positions:
+            start = pos * samples_per_position
+            end = min(start + samples_per_position, actual_batch_size)
+            global_indices.extend(range(start, end))
 
-        for i_local, global_i in enumerate(range(local_start, local_end)):
+        # Log diagnostic info on first batch
+        if storage.shard_count == 0 and not hasattr(process_batch_multihost, '_logged'):
+            import sys
+            print(f"[Host {host_info['host_id']}] FSDP extraction diagnostics:")
+            print(f"  Local shards: {n_local_samples} samples, hidden_dim={host_activations[first_layer_key].shape[-1]}")
+            print(f"  Data axis positions: {local_batch_positions}")
+            print(f"  Global sample indices: {global_indices}")
+            sys.stdout.flush()
+            process_batch_multihost._logged = True
+
+        for i_local, global_i in enumerate(global_indices):
             if global_i >= len(sample_indices):
                 break
             sample_idx = sample_indices[global_i]
@@ -917,12 +954,19 @@ def run_extraction(cfg):
             # Primary host saves cache for future restarts
             if host_info['is_primary'] and ckpt_gcs_bucket:
                 try:
+                    import sys
+                    print(f"  Saving chunk cache ({len(chunks)} chunks) to {cache_path}...")
+                    sys.stdout.flush()
                     save_chunks_cache(
                         chunks, chunk_metadata, stream_metadata,
                         cache_path, verbose=cfg.verbose,
                     )
+                    print(f"  Chunk cache saved successfully")
+                    sys.stdout.flush()
                 except Exception as e:
                     print(f"  Warning: Failed to save chunk cache: {e}")
+                    import traceback; traceback.print_exc()
+                    sys.stdout.flush()
 
         sequences = chunks
         prompts_data = [
@@ -1015,7 +1059,7 @@ def run_extraction(cfg):
         print(f"\n  Synchronizing hosts before extraction...")
 
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-        if not barrier("extraction_start", timeout=300):
+        if not barrier("extraction_start", timeout=1800):
             raise RuntimeError("Failed to synchronize at 'extraction_start' barrier")
     else:
         sync_hosts("extraction_start")

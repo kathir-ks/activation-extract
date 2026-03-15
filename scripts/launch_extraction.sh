@@ -110,7 +110,9 @@ launch_extraction() {
 
     log "Launching extraction on all workers..."
     gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=all --command="
-        cd ~/activation-extract && rm -f extraction.log checkpoints/*.json &&
+        cd ~/activation-extract &&
+        { [ -f extraction.log ] && mv extraction.log extraction.log.prev || true; } &&
+        rm -f checkpoints/*.json &&
         nohup python3 -u multihost_extract.py \
             --topology v5litepod-64 \
             --model_path KathirKs/qwen-2.5-0.5b \
@@ -231,7 +233,17 @@ while true; do
             log "=========================================="
             exit 0
         else
-            log "WARNING: Process died but not completed. Relaunching..."
+            log "WARNING: Process died but not completed."
+            # Check if code still exists (TPU may have been recreated with fresh VMs)
+            code_check=$(gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=0 \
+                --command="test -f ~/activation-extract/multihost_extract.py && echo EXISTS || echo MISSING" \
+                2>/dev/null | tail -1)
+            if [ "$code_check" = "MISSING" ]; then
+                log "Code missing on workers (TPU recreated?). Re-deploying..."
+                RECOVERY_COUNT=$((RECOVERY_COUNT + 1))
+                setup_all_workers
+            fi
+            log "Relaunching..."
             launch_extraction
         fi
     else

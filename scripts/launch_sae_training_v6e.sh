@@ -13,16 +13,16 @@ set -uo pipefail
 
 TPU_NAME="node-v6e-64-europe-west4-a"
 ZONE="europe-west4-a"
-NUM_WORKERS=8
+NUM_WORKERS=16
 TARBALL="/tmp/activation-extract.tar.gz"
 REPO_DIR="/home/kathirks_gc/activation-extract"
 
 # SAE training config
 ARCHITECTURE="topk"
-HIDDEN_DIM=448
-DICT_SIZE=3584        # 8x expansion
+HIDDEN_DIM=896
+DICT_SIZE=7168        # 8x expansion
 K=32
-BATCH_SIZE=4096       # Global batch (512 per host, 64 per device)
+BATCH_SIZE=4096       # Global batch (256 per host, 64 per device)
 NUM_STEPS=200000
 LEARNING_RATE=3e-4
 LR_WARMUP=1000
@@ -109,7 +109,7 @@ setup_all_workers() {
     log "Setting up all $NUM_WORKERS workers..."
     create_tarball
 
-    for batch_start in 0 4; do
+    for batch_start in 0 4 8 12; do
         local batch_end=$((batch_start + 3))
         if [ $batch_end -ge $NUM_WORKERS ]; then
             batch_end=$((NUM_WORKERS - 1))

@@ -110,9 +110,9 @@ TPU_TOPOLOGIES: Dict[str, TopologyConfig] = {
     ),
     'v6e-64': TopologyConfig(
         name='v6e-64',
-        hosts=8,
-        chips_per_host=8,
-        mesh_shape=(8, 8),
+        hosts=16,
+        chips_per_host=4,
+        mesh_shape=(16, 4),
         axis_names=('data', 'model'),
         recommended_batch_size=64,
         recommended_seq_length=2048,

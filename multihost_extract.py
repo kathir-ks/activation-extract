@@ -346,81 +346,78 @@ def process_batch_multihost(
 
     # ── FSDP path: each host extracts its own addressable shard ──────
     if mesh is not None and sharding_specs is not None:
-        # Gather activations along model axis so each host gets full hidden_dim.
-        # Without this, each host only has a slice (e.g. 448 of 896 with model=2).
-        from jax.sharding import PartitionSpec as P
-        data_axis = mesh.axis_names[0]
-        act_sharding = NamedSharding(mesh, P(data_axis, None, None))
+        # Extract activations from local device shards WITHOUT all-gather.
+        # The 3D mesh (data, fsdp, model) splits hidden_dim across the model axis.
+        # Each local device holds [batch_slice, seq_len, hidden_dim/model_size].
+        # We manually concatenate model-axis shards on CPU to recover full hidden_dim.
+        import sys
 
-        # Transfer this host's addressable shards to numpy
         host_activations = {}
-        local_shard_indices = None
+        global_indices = None
         for layer_idx in layers_to_extract:
             layer_key = f'layer_{layer_idx}'
-            if layer_key in activations:
-                # Re-shard to P(data, None, None) — triggers all-gather on model axis
-                full_act = jax.device_put(activations[layer_key], act_sharding)
-                # After re-sharding, local devices may hold identical replicas
-                # (e.g. 4 chips on one host all have the same data shard).
-                # Deduplicate by taking only unique shard indices.
-                local_shards = full_act.addressable_shards
+            if layer_key not in activations:
+                continue
 
-                def _index_key(idx):
-                    """Convert shard index (tuple of slices) to a hashable key."""
-                    return tuple(
-                        (sl.start, sl.stop, sl.step) if isinstance(sl, slice) else sl
-                        for sl in idx
-                    )
+            act = activations[layer_key]
+            local_shards = act.addressable_shards
 
-                seen_indices = {}
-                for s in local_shards:
-                    key = _index_key(s.index)
-                    if key not in seen_indices:
-                        seen_indices[key] = s
-                unique_shards = sorted(seen_indices.values(), key=lambda s: _index_key(s.index))
-                local_data = np.concatenate(
-                    [np.array(s.data) for s in unique_shards], axis=0
-                )
-                host_activations[layer_key] = local_data
-                # Capture shard indices from the first layer
-                if local_shard_indices is None:
-                    local_shard_indices = [
-                        s.index for s in unique_shards
-                    ]
+            # Group shards by their batch position (data axis).
+            # Each shard has an index like (slice(0,1), slice(None), slice(0,448))
+            # where the last slice indicates the model-axis split.
+            # Shards with the same batch slice but different hidden_dim slices
+            # need to be concatenated along hidden_dim.
+            from collections import defaultdict
+            batch_groups = defaultdict(list)
+            for s in local_shards:
+                # Key on the batch (data-axis) slice only
+                batch_key = (s.index[0].start, s.index[0].stop)
+                batch_groups[batch_key].append(s)
 
-        # Map local shard rows back to global sample indices.
-        # Use shard index tuples to determine which data-axis positions
-        # this host owns, rather than assuming host_id maps to data position.
-        first_layer_key = f'layer_{layers_to_extract[0]}'
-        n_local_samples = host_activations[first_layer_key].shape[0]
-        # Shard index tuple's first element is the batch slice (data axis position).
-        # s.index is a tuple of slices, e.g. (slice(0, 1), slice(None), slice(None)).
-        # The batch position is the slice's .start on the first (data) axis.
-        data_axis_size = mesh.shape[data_axis]
-        samples_per_position = actual_batch_size // data_axis_size
-        global_indices = []
-        for idx in local_shard_indices:
-            batch_slice = idx[0]  # slice on data axis
-            if isinstance(batch_slice, slice):
-                # Use the slice start as the position
-                pos_start = batch_slice.start or 0
-                pos_end = batch_slice.stop or (pos_start + 1)
-                for pos in range(pos_start, pos_end):
-                    start = pos * samples_per_position
-                    end = min(start + samples_per_position, actual_batch_size)
-                    global_indices.extend(range(start, end))
-            else:
-                start = batch_slice * samples_per_position
-                end = min(start + samples_per_position, actual_batch_size)
-                global_indices.extend(range(start, end))
-        global_indices = sorted(set(global_indices))
+            # For each batch position, sort model-axis shards by hidden_dim offset
+            # and concatenate to get full hidden_dim
+            batch_keys_sorted = sorted(batch_groups.keys())
+            batch_arrays = []
+            for bkey in batch_keys_sorted:
+                shards = batch_groups[bkey]
+                # Sort by hidden_dim slice start (last axis = model axis)
+                shards_sorted = sorted(shards, key=lambda s: (
+                    s.index[-1].start if isinstance(s.index[-1], slice) and s.index[-1].start is not None else 0
+                ))
+                # Concatenate along hidden_dim axis (axis=-1)
+                parts = [np.array(s.data) for s in shards_sorted]
+                if len(parts) > 1:
+                    full_hidden = np.concatenate(parts, axis=-1)
+                else:
+                    full_hidden = parts[0]
+                batch_arrays.append(full_hidden)
+
+            # Stack batch slices along axis 0
+            local_data = np.concatenate(batch_arrays, axis=0)
+            host_activations[layer_key] = local_data
+
+            # Compute global indices from first layer
+            if global_indices is None:
+                data_axis = mesh.axis_names[0]
+                data_axis_size = mesh.shape[data_axis]
+                samples_per_position = actual_batch_size // data_axis_size
+                global_indices = []
+                for bkey in batch_keys_sorted:
+                    pos_start = bkey[0] if bkey[0] is not None else 0
+                    pos_end = bkey[1] if bkey[1] is not None else (pos_start + 1)
+                    for pos in range(pos_start, pos_end):
+                        start = pos * samples_per_position
+                        end = min(start + samples_per_position, actual_batch_size)
+                        global_indices.extend(range(start, end))
+                global_indices = sorted(set(global_indices))
 
         # Log diagnostic info on first batch
+        first_layer_key = f'layer_{layers_to_extract[0]}'
+        n_local_samples = host_activations[first_layer_key].shape[0]
         if storage.shard_count == 0 and not hasattr(process_batch_multihost, '_logged'):
-            import sys
             print(f"[Host {host_info['host_id']}] FSDP extraction diagnostics:")
             print(f"  Local shards: {n_local_samples} samples, hidden_dim={host_activations[first_layer_key].shape[-1]}")
-            print(f"  Shard indices: {[str(idx) for idx in local_shard_indices]}")
+            print(f"  Batch positions: {batch_keys_sorted}")
             print(f"  Global sample indices: {global_indices}")
             sys.stdout.flush()
             process_batch_multihost._logged = True

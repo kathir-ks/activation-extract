@@ -364,41 +364,63 @@ def process_batch_multihost(
                 # (e.g. 4 chips on one host all have the same data shard).
                 # Deduplicate by taking only unique shard indices.
                 local_shards = full_act.addressable_shards
+
+                def _index_key(idx):
+                    """Convert shard index (tuple of slices) to a hashable key."""
+                    return tuple(
+                        (sl.start, sl.stop, sl.step) if isinstance(sl, slice) else sl
+                        for sl in idx
+                    )
+
                 seen_indices = {}
                 for s in local_shards:
-                    if s.index not in seen_indices:
-                        seen_indices[s.index] = s
-                unique_shards = sorted(seen_indices.values(), key=lambda s: s.index)
+                    key = _index_key(s.index)
+                    if key not in seen_indices:
+                        seen_indices[key] = s
+                unique_shards = sorted(seen_indices.values(), key=lambda s: _index_key(s.index))
                 local_data = np.concatenate(
                     [np.array(s.data) for s in unique_shards], axis=0
                 )
                 host_activations[layer_key] = local_data
                 # Capture shard indices from the first layer
                 if local_shard_indices is None:
-                    local_shard_indices = sorted(set(s.index for s in local_shards))
+                    local_shard_indices = [
+                        s.index for s in unique_shards
+                    ]
 
         # Map local shard rows back to global sample indices.
         # Use shard index tuples to determine which data-axis positions
         # this host owns, rather than assuming host_id maps to data position.
         first_layer_key = f'layer_{layers_to_extract[0]}'
         n_local_samples = host_activations[first_layer_key].shape[0]
-        # Shard index tuple's first element is the batch slice (data axis position)
-        local_batch_positions = sorted(set(idx[0] for idx in local_shard_indices))
-        # Each data position corresponds to (batch_size / data_axis_size) samples
+        # Shard index tuple's first element is the batch slice (data axis position).
+        # s.index is a tuple of slices, e.g. (slice(0, 1), slice(None), slice(None)).
+        # The batch position is the slice's .start on the first (data) axis.
         data_axis_size = mesh.shape[data_axis]
         samples_per_position = actual_batch_size // data_axis_size
         global_indices = []
-        for pos in local_batch_positions:
-            start = pos * samples_per_position
-            end = min(start + samples_per_position, actual_batch_size)
-            global_indices.extend(range(start, end))
+        for idx in local_shard_indices:
+            batch_slice = idx[0]  # slice on data axis
+            if isinstance(batch_slice, slice):
+                # Use the slice start as the position
+                pos_start = batch_slice.start or 0
+                pos_end = batch_slice.stop or (pos_start + 1)
+                for pos in range(pos_start, pos_end):
+                    start = pos * samples_per_position
+                    end = min(start + samples_per_position, actual_batch_size)
+                    global_indices.extend(range(start, end))
+            else:
+                start = batch_slice * samples_per_position
+                end = min(start + samples_per_position, actual_batch_size)
+                global_indices.extend(range(start, end))
+        global_indices = sorted(set(global_indices))
 
         # Log diagnostic info on first batch
         if storage.shard_count == 0 and not hasattr(process_batch_multihost, '_logged'):
             import sys
             print(f"[Host {host_info['host_id']}] FSDP extraction diagnostics:")
             print(f"  Local shards: {n_local_samples} samples, hidden_dim={host_activations[first_layer_key].shape[-1]}")
-            print(f"  Data axis positions: {local_batch_positions}")
+            print(f"  Shard indices: {[str(idx) for idx in local_shard_indices]}")
             print(f"  Global sample indices: {global_indices}")
             sys.stdout.flush()
             process_batch_multihost._logged = True

@@ -287,7 +287,9 @@ def extract_activations_sharded(model, params, input_ids):
         input_ids: [batch, seq_len] - replicated across devices
 
     Returns:
-        activations: Dict mapping layer names to activation tensors
+        activations: Dict mapping layer names to activation tensors,
+                     constrained to P('data', None, None) so each host
+                     gets full hidden_dim for its batch slice
     """
     # Single forward pass with sharded params - NO GENERATION!
     # The model automatically handles sharded computation across devices
@@ -297,7 +299,15 @@ def extract_activations_sharded(model, params, input_ids):
         return_activations=True
     )
 
-    return activations
+    # Constrain output activations: batch sharded on data axis, hidden_dim fully gathered.
+    # Without this, XLA may leave hidden_dim sharded across the fsdp axis,
+    # causing each host to only see a slice (e.g., 448 instead of 896).
+    constrained = {}
+    for k, v in activations.items():
+        constrained[k] = jax.lax.with_sharding_constraint(
+            v, P('data', None, None)
+        )
+    return constrained
 
 
 def pad_sequences(

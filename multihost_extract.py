@@ -346,11 +346,12 @@ def process_batch_multihost(
 
     # ── FSDP path: each host extracts its own addressable shard ──────
     if mesh is not None and sharding_specs is not None:
-        # Extract activations from local device shards WITHOUT all-gather.
-        # The 3D mesh (data, fsdp, model) splits hidden_dim across the model axis.
-        # Each local device holds [batch_slice, seq_len, hidden_dim/model_size].
-        # We manually concatenate model-axis shards on CPU to recover full hidden_dim.
+        # With P('data', None, None) sharding constraint on activations,
+        # each host's local devices hold the same data (replicated across fsdp).
+        # We group shards by unique (batch_position, hidden_dim_range) and
+        # concatenate only truly distinct hidden_dim slices.
         import sys
+        from collections import defaultdict
 
         host_activations = {}
         global_indices = None
@@ -362,37 +363,36 @@ def process_batch_multihost(
             act = activations[layer_key]
             local_shards = act.addressable_shards
 
-            # Group shards by their batch position (data axis).
-            # Each shard has an index like (slice(0,1), slice(None), slice(0,448))
-            # where the last slice indicates the model-axis split.
-            # Shards with the same batch slice but different hidden_dim slices
-            # need to be concatenated along hidden_dim.
-            from collections import defaultdict
+            # Group shards by batch position (data axis)
             batch_groups = defaultdict(list)
             for s in local_shards:
-                # Key on the batch (data-axis) slice only
                 batch_key = (s.index[0].start, s.index[0].stop)
                 batch_groups[batch_key].append(s)
 
-            # For each batch position, sort model-axis shards by hidden_dim offset
-            # and concatenate to get full hidden_dim
             batch_keys_sorted = sorted(batch_groups.keys())
             batch_arrays = []
             for bkey in batch_keys_sorted:
                 shards = batch_groups[bkey]
-                # Sort by hidden_dim slice start (last axis = model axis)
-                shards_sorted = sorted(shards, key=lambda s: (
-                    s.index[-1].start if isinstance(s.index[-1], slice) and s.index[-1].start is not None else 0
-                ))
-                # Concatenate along hidden_dim axis (axis=-1)
-                parts = [np.array(s.data) for s in shards_sorted]
+
+                # Deduplicate: group by hidden_dim range to find unique slices.
+                # With P('data', None, None), all shards have same hidden range
+                # (fsdp replicas). With other shardings, there may be distinct slices.
+                hidden_slices = defaultdict(list)
+                for s in shards:
+                    h_start = s.index[-1].start if (isinstance(s.index[-1], slice) and s.index[-1].start is not None) else 0
+                    h_stop = s.index[-1].stop  # None means full extent
+                    hidden_slices[(h_start, h_stop)].append(s)
+
+                # Take one shard per unique hidden_dim range, sorted by offset
+                unique_keys = sorted(hidden_slices.keys())
+                parts = [np.array(hidden_slices[hk][0].data) for hk in unique_keys]
+
                 if len(parts) > 1:
                     full_hidden = np.concatenate(parts, axis=-1)
                 else:
                     full_hidden = parts[0]
                 batch_arrays.append(full_hidden)
 
-            # Stack batch slices along axis 0
             local_data = np.concatenate(batch_arrays, axis=0)
             host_activations[layer_key] = local_data
 
@@ -411,13 +411,17 @@ def process_batch_multihost(
                         global_indices.extend(range(start, end))
                 global_indices = sorted(set(global_indices))
 
-        # Log diagnostic info on first batch
+        # Log diagnostic info
         first_layer_key = f'layer_{layers_to_extract[0]}'
         n_local_samples = host_activations[first_layer_key].shape[0]
-        if storage.shard_count == 0 and not hasattr(process_batch_multihost, '_logged'):
+        if not hasattr(process_batch_multihost, '_logged'):
             print(f"[Host {host_info['host_id']}] FSDP extraction diagnostics:")
-            print(f"  Local shards: {n_local_samples} samples, hidden_dim={host_activations[first_layer_key].shape[-1]}")
+            print(f"  Addressable shards: {len(act.addressable_shards)}")
+            print(f"  Unique batch positions: {len(batch_keys_sorted)}")
             print(f"  Batch positions: {batch_keys_sorted}")
+            print(f"  Unique hidden slices per position: {len(unique_keys)}")
+            print(f"  Hidden slice keys: {unique_keys}")
+            print(f"  Local samples: {n_local_samples}, hidden_dim={host_activations[first_layer_key].shape[-1]}")
             print(f"  Global sample indices: {global_indices}")
             sys.stdout.flush()
             process_batch_multihost._logged = True

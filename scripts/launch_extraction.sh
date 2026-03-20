@@ -133,6 +133,7 @@ launch_extraction() {
             --barrier_controller_host $barrier_host \
             --barrier_port 5555 \
             --checkpoint_gcs_prefix $CHECKPOINT_PREFIX \
+            --fsdp_size 4 \
             > extraction.log 2>&1 &
         echo 'Launched'
     " 2>/dev/null | tail -20

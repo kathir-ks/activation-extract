@@ -1,12 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# SAE Training Launcher for v6e-64 TPU pod
+# SAE Training Launcher v2 — Improved configuration
 #
-# Trains a Sparse Autoencoder on pre-extracted layer 19 activations
-# using all 8 hosts (64 chips) for data-parallel training.
+# Changes from v1:
+#   - num_steps: 200K -> 150K (diminishing returns after 100K)
+#   - dead_neuron_resample_until: 75K (stop resampling in 2nd half)
+#   - New checkpoint prefix to avoid overwriting v1
+#   - ml_dtypes in pip install for bfloat16 checkpoint compatibility
 #
 # Run with nohup:
-#   nohup bash scripts/launch_sae_training_v6e.sh > sae_training.log 2>&1 &
+#   nohup bash scripts/launch_sae_training_v2.sh > sae_training_v2.log 2>&1 &
 # =============================================================================
 
 set -uo pipefail
@@ -23,10 +26,14 @@ HIDDEN_DIM=896
 DICT_SIZE=7168        # 8x expansion (896 * 8)
 K=32
 BATCH_SIZE=4096       # Global batch (256 per host, 64 per device)
-NUM_STEPS=200000
+NUM_STEPS=150000
 LEARNING_RATE=3e-4
 LR_WARMUP=1000
 DTYPE="bfloat16"
+
+# Dead neuron resampling: stop at step 75K to prevent late-training divergence
+DEAD_NEURON_RESAMPLE_STEPS=25000
+DEAD_NEURON_RESAMPLE_UNTIL=75000
 
 # Data source: merged 896-dim activations (paired host shards concatenated)
 GCS_PATH="gs://arc-data-europe-west4/activations/layer19_merged_50k"
@@ -73,8 +80,7 @@ create_tarball() {
     log "Creating tarball..."
     cd /home/kathirks_gc
 
-    # Include main repo AND the sae-worktree sae/ directory
-    # First sync sae/ from worktree into main repo for deployment
+    # Sync sae/ from worktree into main repo for deployment
     rsync -a --delete \
         /home/kathirks_gc/sae-worktree/sae/ \
         /home/kathirks_gc/activation-extract/sae/
@@ -128,11 +134,11 @@ launch_training() {
     barrier_host=$(get_worker0_ip)
     log "Worker 0 IP (barrier host): $barrier_host"
 
-    log "Launching SAE training on all workers..."
+    log "Launching SAE training v2 on all workers..."
     gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=all --command="
         cd ~/activation-extract &&
         export PYTHONUNBUFFERED=1 &&
-        nohup stdbuf -oL python3 -u -m sae.scripts.train \
+        nohup python3 -u -m sae.scripts.train \
             --architecture $ARCHITECTURE \
             --hidden_dim $HIDDEN_DIM \
             --dict_size $DICT_SIZE \
@@ -148,6 +154,8 @@ launch_training() {
             --lr_warmup_steps $LR_WARMUP \
             --lr_decay cosine \
             --shuffle_buffer_size 262144 \
+            --dead_neuron_resample_steps $DEAD_NEURON_RESAMPLE_STEPS \
+            --dead_neuron_resample_until $DEAD_NEURON_RESAMPLE_UNTIL \
             --log_every $LOG_EVERY \
             --eval_every $EVAL_EVERY \
             --log_dir $LOG_DIR \
@@ -155,7 +163,7 @@ launch_training() {
             --checkpoint_every $CHECKPOINT_EVERY \
             --upload_checkpoints_to_gcs \
             --checkpoint_gcs_bucket arc-data-europe-west4 \
-            --checkpoint_gcs_prefix sae_checkpoints/layer19_topk_896d_v5e64 \
+            --checkpoint_gcs_prefix sae_checkpoints/layer19_topk_896d_v2 \
             --mesh_type data_parallel \
             --enable_barrier_sync \
             --barrier_controller_host $barrier_host \
@@ -191,12 +199,14 @@ wait_for_tpu_ready() {
 # =============================================================================
 
 log "=========================================="
-log "SAE Training Launcher (v6e-64)"
+log "SAE Training Launcher v2 (v5e-64)"
 log "=========================================="
 log "TPU: $TPU_NAME ($ZONE)"
 log "Architecture: $ARCHITECTURE (hidden=$HIDDEN_DIM, dict=$DICT_SIZE, k=$K)"
 log "Data: $GCS_PATH (layer $LAYER_INDEX)"
 log "Training: batch=$BATCH_SIZE, steps=$NUM_STEPS, lr=$LEARNING_RATE"
+log "Dead neuron resample: every ${DEAD_NEURON_RESAMPLE_STEPS} steps, stop at step $DEAD_NEURON_RESAMPLE_UNTIL"
+log "Checkpoint prefix: sae_checkpoints/layer19_topk_896d_v2"
 log "Dtype: $DTYPE"
 log "=========================================="
 
@@ -250,7 +260,7 @@ while true; do
         completed=$(check_training_completed 2>/dev/null || echo "UNKNOWN")
         if [ "$completed" = "DONE" ]; then
             log "=========================================="
-            log "SAE TRAINING COMPLETED SUCCESSFULLY!"
+            log "SAE TRAINING V2 COMPLETED SUCCESSFULLY!"
             log "Total recoveries: $RECOVERY_COUNT"
             log "=========================================="
             exit 0

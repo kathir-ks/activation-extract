@@ -187,7 +187,11 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
         return {
             'weights': NamedSharding(mesh, P('fsdp', 'model')),  # Shard outer dim on fsdp, inner on model
             'embed': NamedSharding(mesh, P('fsdp', None)),       # Shard vocab on fsdp
-            'bias': NamedSharding(mesh, P('model')),             # Shard bias on model
+            # Biases are 1-D (length = out_features of weight). Replicating is
+            # always safe; sharding on 'model' would split Q/K/V biases across
+            # attention heads and silently produce wrong attention whenever
+            # model_size > 1. Keep replicated.
+            'bias': NamedSharding(mesh, P(None)),
             'layernorm': NamedSharding(mesh, P(None)),           # Replicated
             'replicated': NamedSharding(mesh, P(None, None, None)),
             'input': NamedSharding(mesh, P('data', None)),       # Input batch sharded on data axis

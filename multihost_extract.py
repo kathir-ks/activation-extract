@@ -396,19 +396,19 @@ def process_batch_multihost(
             local_data = np.concatenate(batch_arrays, axis=0)
             host_activations[layer_key] = local_data
 
-            # Compute global indices from first layer
+            # Compute global indices from first layer.
+            # bkey = (start, stop) from shard.index[0] already encodes the
+            # global batch-sample range this shard covers. Padded rows (those
+            # beyond actual_batch_size) are dropped so downstream indexing into
+            # sample_indices stays valid.
             if global_indices is None:
-                data_axis = mesh.axis_names[0]
-                data_axis_size = mesh.shape[data_axis]
-                samples_per_position = actual_batch_size // data_axis_size
                 global_indices = []
                 for bkey in batch_keys_sorted:
-                    pos_start = bkey[0] if bkey[0] is not None else 0
-                    pos_end = bkey[1] if bkey[1] is not None else (pos_start + 1)
-                    for pos in range(pos_start, pos_end):
-                        start = pos * samples_per_position
-                        end = min(start + samples_per_position, actual_batch_size)
-                        global_indices.extend(range(start, end))
+                    start = bkey[0] if bkey[0] is not None else 0
+                    stop = bkey[1] if bkey[1] is not None else actual_batch_size
+                    stop = min(stop, actual_batch_size)
+                    if stop > start:
+                        global_indices.extend(range(start, stop))
                 global_indices = sorted(set(global_indices))
 
         # Log diagnostic info

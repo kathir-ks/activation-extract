@@ -16,7 +16,7 @@ class SAEConfig:
     architecture: str = "vanilla"
 
     # -- Sparsity parameters (architecture-specific) --
-    # Vanilla / Gated: L1 coefficient
+    # Sparsity penalty coefficient: L1 (vanilla/gated) or L0 (jumprelu)
     l1_coeff: float = 5e-3
 
     # TopK: number of active features

@@ -171,10 +171,19 @@ class BarrierServer:
             
             logger.info(f"Worker {worker_id} from {addr} reached barrier '{barrier_name}'")
             
-            # Register worker and wait
-            # Use connection address for unique key (worker_id may not be unique before JAX init)
+            # Register worker and wait.
+            # Key on worker_id (not ephemeral port) so retries overwrite
+            # instead of double-counting.
             with self._barrier_lock:
-                key = f"{barrier_name}:{addr[0]}:{addr[1]}"  # Use IP:port as unique key
+                key = f"{barrier_name}:{worker_id}"
+                if key in self._connected_workers:
+                    old_conn = self._connected_workers[key]
+                    logger.warning(f"Worker {worker_id} re-registered at barrier '{barrier_name}' "
+                                   f"(retry from {addr}), closing stale connection")
+                    try:
+                        old_conn.close()
+                    except Exception:
+                        pass
                 self._connected_workers[key] = conn
                 
                 # Check if all workers have reached this barrier

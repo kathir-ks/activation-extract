@@ -448,15 +448,25 @@ class QwenModel(nn.Module):
 
         # Create causal mask if not provided
         if attention_mask is None:
-            # For generation with KV cache: when we have cached states, create appropriate mask
             if kv_caches is not None:
-                # With cache: we're decoding, no masking needed (attend to all previous tokens)
-                # We'll handle this in attention by not applying any mask
-                attention_mask = None  # Will be handled in attention layer
+                # Decode phase: current tokens attend to all cached + current positions.
+                # kv_caches[0][0] shape = (batch, num_kv_heads, cache_len, head_dim)
+                cache_len = kv_caches[0][0].shape[2] if kv_caches[0] is not None else 0
+                total_len = cache_len + seq_len
+                # (seq_len, total_len) mask: current query positions attend to
+                # all past cached positions and causally within the new tokens
+                mask = jnp.ones((seq_len, total_len))
+                if seq_len > 1:
+                    # Multi-token decode: causal within new tokens
+                    q_indices = jnp.arange(seq_len)[:, None] + cache_len
+                    k_indices = jnp.arange(total_len)[None, :]
+                    mask = jnp.where(k_indices <= q_indices, 1.0, 0.0)
+                attention_mask = jnp.where(mask == 0, jnp.finfo(jnp.float32).min, 0.0)
+                attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
             else:
-                # No cache: prefill phase, use causal mask
+                # Prefill phase: standard causal mask
                 attention_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-                attention_mask = jnp.where(attention_mask == 0, -1e9, 0.0)
+                attention_mask = jnp.where(attention_mask == 0, jnp.finfo(jnp.float32).min, 0.0)
                 attention_mask = jnp.expand_dims(jnp.expand_dims(attention_mask, 0), 0)
 
         # Compute RoPE embeddings once, shared across all layers

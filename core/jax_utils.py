@@ -186,7 +186,7 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
         # model: Tensor parallelism
         return {
             'weights': NamedSharding(mesh, P('fsdp', 'model')),  # Shard outer dim on fsdp, inner on model
-            'embed': NamedSharding(mesh, P('fsdp', None)),       # Shard vocab on fsdp
+            'embed': NamedSharding(mesh, P(None, 'model')),       # Shard hidden on model (vocab replicated for lookups)
             # Biases are 1-D (length = out_features of weight). Replicating is
             # always safe; sharding on 'model' would split Q/K/V biases across
             # attention heads and silently produce wrong attention whenever
@@ -219,7 +219,11 @@ def create_sharding_strategy(mesh: Mesh) -> Dict[str, NamedSharding]:
             'input': NamedSharding(mesh, P('data', None)),     # Input batch sharded on data axis
         }
     elif 'model' in mesh.axis_names:
-        # 1D mesh: shard along model axis
+        # 1D mesh: shard along model axis — single-host only
+        assert jax.process_count() == 1, (
+            "1D mesh ('model',) must not be used in multi-host. "
+            "Use 2D (data, fsdp) or 3D (data, fsdp, model) mesh instead."
+        )
         return {
             'weights': NamedSharding(mesh, P(None, 'model')),
             'embed': NamedSharding(mesh, P('model', None)),

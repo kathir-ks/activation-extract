@@ -111,7 +111,7 @@ class ActivationStorage:
 
         # Estimate size (activation array + metadata overhead)
         activation_size = activation.nbytes
-        metadata_overhead = 1024  # Rough estimate for metadata
+        metadata_overhead = 600
         self.buffer_size_bytes += activation_size + metadata_overhead
 
         # Check if we should save a shard
@@ -158,8 +158,8 @@ class ActivationStorage:
         if self.upload_to_gcs:
             gcs_path = self._upload_to_gcs(shard_path, shard_name)
 
-        # Record metadata
-        self.metadata.append({
+        # Record metadata only AFTER upload attempt so gcs_path reflects reality
+        shard_meta = {
             'shard_id': self.shard_count,
             'filename': shard_name,
             'local_path': str(shard_path),
@@ -169,9 +169,10 @@ class ActivationStorage:
             'layers': list(self.buffer.keys()),
             'samples_per_layer': {layer: len(acts) for layer, acts in self.buffer.items()},
             'total_samples_in_shard': sum(len(acts) for acts in self.buffer.values())
-        })
+        }
+        self.metadata.append(shard_meta)
 
-        # Delete local file if requested
+        # Only delete local file if upload actually succeeded
         if self.upload_to_gcs and self.delete_local_after_upload and gcs_path:
             shard_path.unlink()
             if self.verbose:
@@ -181,24 +182,30 @@ class ActivationStorage:
         self.buffer = {}
         self.buffer_size_bytes = 0
 
-    def _upload_to_gcs(self, local_path: Path, shard_name: str) -> Optional[str]:
-        """Upload shard to GCS using fsspec"""
-        try:
-            gcs_path = f"gs://{self.gcs_bucket}/{self.gcs_prefix}/{shard_name}"
+    def _upload_to_gcs(self, local_path: Path, shard_name: str,
+                       max_retries: int = 3, backoff: float = 5.0) -> Optional[str]:
+        """Upload shard to GCS using fsspec with retry."""
+        import time as _time
+        gcs_path = f"gs://{self.gcs_bucket}/{self.gcs_prefix}/{shard_name}"
 
-            if self.verbose:
-                print(f"  ⬆ Uploading to {gcs_path}...")
+        for attempt in range(1, max_retries + 1):
+            try:
+                if self.verbose:
+                    label = f" (attempt {attempt}/{max_retries})" if attempt > 1 else ""
+                    print(f"  ⬆ Uploading to {gcs_path}...{label}")
 
-            # Upload using fsspec
-            self.fs.put_file(str(local_path), gcs_path)
+                self.fs.put_file(str(local_path), gcs_path)
 
-            if self.verbose:
-                print(f"  ✓ Uploaded to GCS: {gcs_path}")
+                if self.verbose:
+                    print(f"  ✓ Uploaded to GCS: {gcs_path}")
+                return gcs_path
+            except Exception as e:
+                print(f"  ✗ Upload attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    _time.sleep(backoff * attempt)
 
-            return gcs_path
-        except Exception as e:
-            print(f"  ✗ Failed to upload to GCS: {e}")
-            return None
+        print(f"  ✗ All {max_retries} upload attempts failed for {shard_name}")
+        return None
 
     def finalize(self):
         """Save remaining activations and metadata"""
@@ -206,19 +213,29 @@ class ActivationStorage:
         if self.buffer:
             self._save_shard()
 
-        # Save metadata
+        # Save metadata locally and to GCS
         metadata_file = self.output_dir / 'metadata.json'
+        metadata_content = {
+            'total_shards': self.shard_count,
+            'total_activations': self.total_activations,
+            'total_unique_samples': len(self.seen_sample_indices),
+            'shard_size_gb': self.shard_size_bytes / (1024 * 1024 * 1024),
+            'upload_to_gcs': self.upload_to_gcs,
+            'gcs_bucket': self.gcs_bucket,
+            'gcs_prefix': self.gcs_prefix,
+            'shards': self.metadata
+        }
         with open(metadata_file, 'w') as f:
-            json.dump({
-                'total_shards': self.shard_count,
-                'total_activations': self.total_activations,
-                'total_unique_samples': len(self.seen_sample_indices),
-                'shard_size_gb': self.shard_size_bytes / (1024 * 1024 * 1024),
-                'upload_to_gcs': self.upload_to_gcs,
-                'gcs_bucket': self.gcs_bucket,
-                'gcs_prefix': self.gcs_prefix,
-                'shards': self.metadata
-            }, f, indent=2)
+            json.dump(metadata_content, f, indent=2)
+
+        if self.upload_to_gcs and self.fs is not None:
+            try:
+                gcs_meta = f"gs://{self.gcs_bucket}/{self.gcs_prefix}/metadata.json"
+                self.fs.put_file(str(metadata_file), gcs_meta)
+                if self.verbose:
+                    print(f"  ✓ Uploaded metadata to {gcs_meta}")
+            except Exception as e:
+                print(f"  ✗ Failed to upload metadata.json to GCS: {e}")
 
         if self.verbose:
             print(f"\n{'='*70}")

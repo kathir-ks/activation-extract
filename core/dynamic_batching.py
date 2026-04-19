@@ -127,7 +127,7 @@ def create_dynamic_batches(
               f"({filtered_count/total_before*100:.1f}%)")
 
     # 2. Sort valid sequences by length (deterministic for multihost consistency)
-    valid_indices_sorted = sorted(valid_indices, key=lambda i: len(sequences[i]))
+    valid_indices_sorted = sorted(valid_indices, key=lambda i: (len(sequences[i]), i))
 
     sorted_sequences = [sequences[i] for i in valid_indices_sorted]
     sorted_prompts = [prompts_data[i] for i in valid_indices_sorted]

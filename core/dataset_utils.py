@@ -65,11 +65,11 @@ def load_arc_dataset_jsonl(
                 if "task_id" in task_obj:
                     task_id = task_obj["task_id"]
                 else:
-                    task_id = f"task_{line_idx:08x}"
+                    task_id = f"task_{machine_id}_{task_count:08x}"
 
-                # Ensure unique key: fall back to line index if task_id already seen
+                # Ensure unique key: fall back to per-machine counter
                 if task_id in tasks:
-                    task_id = f"task_{line_idx:08x}"
+                    task_id = f"task_{machine_id}_{task_count:08x}"
 
                 # Store task data
                 task_data = {

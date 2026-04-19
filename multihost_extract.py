@@ -782,30 +782,59 @@ def run_extraction(cfg):
             start_sample_idx = -1  # signals "completed"
 
     # Validate all hosts resume from the same point.
-    # Each host uses start_sample_idx in the barrier name — if any host has a
-    # different value (e.g. stale local checkpoint vs fresh GCS checkpoint),
-    # the barrier will timeout because not all hosts reach the same barrier name.
+    # Use a fixed barrier name so all hosts rendezvous regardless of their
+    # local start_sample_idx. After the barrier, verify agreement via a
+    # shared GCS file written by the primary host.
     if host_info['is_primary']:
         print(f"  Checkpoint sync: host {host_info['host_id']} resuming from sample {start_sample_idx}")
     if cfg.enable_barrier_sync and host_info['num_hosts'] > 1:
-        barrier_name = f"checkpoint_loaded_at_{start_sample_idx}"
-        passed = barrier(barrier_name, timeout=120)
+        # Write this host's start_sample_idx to a per-host GCS file
+        import json as _json
+        _sync_prefix = f"gs://{cfg.gcs_bucket}/{cfg.gcs_prefix}/_checkpoint_sync"
+        _sync_file = f"{_sync_prefix}/host_{host_info['host_id']:02d}.json"
+        try:
+            import fsspec
+            _fs = fsspec.filesystem('gcs')
+            with _fs.open(_sync_file, 'w') as _f:
+                _json.dump({"host_id": host_info['host_id'],
+                            "start_sample_idx": start_sample_idx}, _f)
+        except Exception as _e:
+            print(f"  Warning: could not write checkpoint sync file: {_e}")
+
+        passed = barrier("checkpoint_loaded", timeout=30)
         if not passed:
-            msg = (
-                f"\n{'='*60}\n"
-                f"CHECKPOINT MISMATCH DETECTED (Host {host_info['host_id']})\n"
-                f"{'='*60}\n"
-                f"This host wants to resume from sample {start_sample_idx},\n"
-                f"but other hosts are at a different point.\n\n"
-                f"This usually means one host loaded a stale local checkpoint\n"
-                f"while others loaded from GCS (or vice versa).\n\n"
-                f"Fix: Delete local checkpoints on all hosts and retry:\n"
-                f"  rm -rf {cfg.checkpoint_dir}/checkpoint_*.json\n"
-                f"The pipeline will then load from GCS consistently.\n"
-                f"{'='*60}\n"
+            raise RuntimeError(
+                f"Barrier timeout at 'checkpoint_loaded' on host {host_info['host_id']}. "
+                f"Local start_sample_idx={start_sample_idx}."
             )
-            print(msg, flush=True)
-            raise RuntimeError(f"Checkpoint mismatch: host {host_info['host_id']} at sample {start_sample_idx}")
+
+        # After barrier: primary reads all sync files and checks agreement
+        if host_info['is_primary']:
+            try:
+                _all_values = {}
+                for _hid in range(host_info['num_hosts']):
+                    _hf = f"{_sync_prefix}/host_{_hid:02d}.json"
+                    with _fs.open(_hf, 'r') as _f:
+                        _all_values[_hid] = _json.load(_f)["start_sample_idx"]
+                _unique = set(_all_values.values())
+                if len(_unique) > 1:
+                    msg = (
+                        f"\n{'='*60}\n"
+                        f"CHECKPOINT MISMATCH DETECTED\n"
+                        f"{'='*60}\n"
+                        f"Per-host start_sample_idx: {_all_values}\n\n"
+                        f"This usually means one host loaded a stale local checkpoint\n"
+                        f"while others loaded from GCS (or vice versa).\n\n"
+                        f"Fix: Delete local checkpoints on all hosts and retry:\n"
+                        f"  rm -rf {cfg.checkpoint_dir}/checkpoint_*.json\n"
+                        f"{'='*60}\n"
+                    )
+                    print(msg, flush=True)
+                    raise RuntimeError(
+                        f"Checkpoint mismatch across hosts: {_all_values}"
+                    )
+            except (FileNotFoundError, KeyError) as _e:
+                print(f"  Warning: could not verify checkpoint sync: {_e}")
     else:
         sync_hosts("checkpoint_loaded")
 

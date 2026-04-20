@@ -121,16 +121,22 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --command="
         cd ~/$WORK_DIR && JAX_PLATFORMS=cpu python3 tests/test_code_fixes.py && \
         echo '' && echo '--- Resume & Streams Tests ---' && \
-        JAX_PLATFORMS=cpu python3 -m unittest tests.test_resume_and_streams -v
+        JAX_PLATFORMS=cpu python3 -m unittest tests.test_resume_and_streams -v && \
+        echo '' && echo '--- E2E Extraction Tests ---' && \
+        JAX_PLATFORMS=cpu python3 tests/test_e2e_extraction.py && \
+        echo '' && echo '--- JAX vs HF Validation ---' && \
+        JAX_PLATFORMS=cpu python3 tests/test_jax_vs_hf.py && \
+        echo '' && echo '--- Multihost Equivalence (smoke) ---' && \
+        JAX_PLATFORMS=cpu python3 tests/test_multihost_equivalence.py
     "
 
 UNIT_EXIT=$?
 echo ""
 
 if [ $UNIT_EXIT -eq 0 ]; then
-    echo "✅ Unit tests passed on all workers"
+    echo "Unit tests passed on all workers"
 else
-    echo "❌ Unit tests failed (exit code: $UNIT_EXIT)"
+    echo "Unit tests failed (exit code: $UNIT_EXIT)"
     exit $UNIT_EXIT
 fi
 

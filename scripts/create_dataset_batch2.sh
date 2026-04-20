@@ -27,7 +27,7 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \
     --worker=0 \
     --command="
-        cd ~/$WORK_DIR && git fetch --all -q && git reset --hard origin/fix/dynamic-seq-length -q
+        cd ~/$WORK_DIR && git fetch --all -q && git reset --hard origin/production/extraction-v2 -q
         echo 'Code updated on worker 0'
     "
 

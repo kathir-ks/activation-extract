@@ -23,12 +23,19 @@ echo ""
 
 # Step 1: Ensure latest code is on worker 0
 echo "Step 1: Pulling latest code on worker 0..."
+REPO_URL="https://github.com/kathir-ks/activation-extract.git"
 gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE \
     --worker=0 \
     --command="
-        cd ~/$WORK_DIR && git fetch --all -q && git reset --hard origin/production/extraction-v2 -q
-        echo 'Code updated on worker 0'
+        if [ -d ~/$WORK_DIR ]; then
+            cd ~/$WORK_DIR && git fetch --all -q && git reset --hard origin/production/extraction-v2 -q
+        else
+            git clone $REPO_URL ~/$WORK_DIR
+            cd ~/$WORK_DIR && git checkout production/extraction-v2
+        fi
+        mkdir -p data
+        echo 'Code ready on worker 0'
     "
 
 # Step 2: Install deps and create dataset
@@ -70,10 +77,10 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --worker=0 \
     --command="
         cd ~/$WORK_DIR
-        gsutil cp data/combined_50k_batch2.jsonl $GCS_DEST
+        gcloud storage cp data/combined_50k_batch2.jsonl $GCS_DEST
         echo ''
         echo 'Uploaded to GCS:'
-        gsutil ls -l $GCS_DEST
+        gcloud storage ls -l $GCS_DEST
     "
 
 echo ""

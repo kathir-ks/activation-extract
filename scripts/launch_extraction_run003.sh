@@ -165,7 +165,7 @@ launch_extraction() {
             --shard_size_gb $SHARD_SIZE_GB \
             --delete_local_after_upload \
             --enable_barrier_sync \
-            --barrier_controller_host \$barrier_host \
+            --barrier_controller_host $barrier_host \
             --barrier_port 5555 \
             --checkpoint_gcs_prefix $CHECKPOINT_PREFIX \
             --verbose \
@@ -215,7 +215,7 @@ log "=========================================="
 # Verify dataset exists on GCS
 log "Verifying dataset exists..."
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone="$ZONE" --worker=0 \
-    --command="gsutil ls -l $DATASET_PATH 2>/dev/null || echo 'DATASET_MISSING'" \
+    --command="gcloud storage ls -l $DATASET_PATH 2>/dev/null || echo 'DATASET_MISSING'" \
     2>/dev/null | tail -2 | while read -r line; do
     if echo "$line" | grep -q "DATASET_MISSING"; then
         log "ERROR: Dataset not found at $DATASET_PATH"
